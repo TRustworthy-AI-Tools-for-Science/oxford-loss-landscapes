@@ -1,5 +1,10 @@
 # Oxford Loss Landscapes
 
+[![Python](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?logo=pytorch)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Documentation](https://img.shields.io/badge/docs-sphinx-blue.svg)](https://trustworthy-ai-tools-for-science.github.io/oxford-loss-landscapes)
+
 Loss landscapes for explainable AI - A Python library for visualizing and analyzing neural network loss landscapes. 
 
 Developed as part of the 2025 Research Software Engineering workshop at Oxford.
