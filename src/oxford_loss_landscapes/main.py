@@ -121,14 +121,14 @@ def _evaluate_plane_parallel(start_point, dir_one, dir_two, steps, metric, model
             import torch
             
             # Clone tensors to avoid deepcopy issues with gradients
-            # Convert to CPU and detach from computation graph for serialization
+            # Detach from computation graph for safe cloning/serialization while preserving device placement
             current_point_data = []
             for param in row_start_point.parameters:
-                current_point_data.append(param.data.clone().detach().cpu())
+                current_point_data.append(param.data.clone().detach())
             
             d2_data = []
             for param in d2.parameters:
-                d2_data.append(param.data.clone().detach().cpu())
+                d2_data.append(param.data.clone().detach())
             
             # Create independent model wrapper copy
             local_wrapper = copy.deepcopy(wrapper)
