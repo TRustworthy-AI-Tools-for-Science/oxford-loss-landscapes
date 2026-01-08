@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
-
+import torch
 
 @dataclass
 class VRPCAConfig:
@@ -49,10 +49,8 @@ class VRPCAResult:
     converged: bool
     elapsed_time: float
 
-    def normalized_vector(self) -> "torch.Tensor":
+    def normalized_vector(self) -> torch.Tensor:
         """Return the stored eigenvector renormalized to unit length."""
-        import torch
-
         vec = self.eigenvector
         norm = vec.norm().clamp_min(torch.finfo(vec.dtype).eps)
         return vec / norm
