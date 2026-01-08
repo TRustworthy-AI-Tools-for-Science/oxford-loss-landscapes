@@ -1,6 +1,13 @@
 # Oxford Loss Landscapes
 
-Loss Landscapes for EXplainable AI - A Python library for visualizing and analyzing neural network loss landscapes.
+[![Python](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?logo=pytorch)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Documentation](https://img.shields.io/badge/docs-sphinx-blue.svg)](https://trustworthy-ai-tools-for-science.github.io/oxford-loss-landscapes)
+
+Loss landscapes for explainable AI - A Python library for visualizing and analyzing neural network loss landscapes. 
+
+Developed as part of the 2025 Research Software Engineering workshop at Oxford.
 
 ## Overview
 
@@ -153,15 +160,6 @@ oxford_rse_project4/
 └── pyproject.toml                  # Modern Python packaging config
 ```
 
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-
-5. Submit a pull request
-
 ## Requirements
 
 - Python >=3.8 (Python 3.12 recommended for best compatibility)
@@ -188,7 +186,7 @@ If you use this library in your research, please consider citing:
 @software{oxford_loss_landscapes,
   title = {Oxford Loss Landscapes: A library for visualizing and analyzing neural network loss landscapes},
   author = {Ashley S. Dale AND Paige E. Bowling AND Christian D. Harding AND Alok Ghosh AND Ryan Daniels},
-  url = {https://github.com/daleas0120/oxford_rse_project4},
+  url = {https://github.com/TRustworthy-AI-Tools-for-Science/oxford-loss-landscapes},
   year = {2025}
 }
 ```
