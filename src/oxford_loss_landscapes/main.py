@@ -117,7 +117,6 @@ def _evaluate_plane_parallel(start_point, dir_one, dir_two, steps, metric, model
             :param row_idx: Row index for snake-like traversal pattern
             :return: List of metric values for this row
             """
-            import copy
             import torch
             
             # Clone tensors to avoid deepcopy issues with gradients
