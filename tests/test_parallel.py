@@ -8,7 +8,6 @@ import torch.nn as nn
 
 from oxford_loss_landscapes import main
 from oxford_loss_landscapes.model_interface.model_wrapper import SimpleModelWrapper, wrap_model
-from oxford_loss_landscapes.metrics import Loss
 
 
 class DummyModelWrapper:
