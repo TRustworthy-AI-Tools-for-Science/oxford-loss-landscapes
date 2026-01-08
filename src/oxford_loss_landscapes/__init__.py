@@ -28,6 +28,8 @@ Example:
     >>> landscape = oll.random_plane(model_wrapper, distance=1.0, steps=51)
 """
 
+import logging
+
 try:
     from ._version import __version__
 except ImportError:
@@ -64,8 +66,8 @@ try:
 except ImportError as e:
     # Dashboard dependencies (streamlit, plotly) not available
     # Install with: pip install -e ".[advanced]"
-    print(f"Optional dashboard dependencies not available: {e}")
-    print("For dashboard functionality, please install: pip install -e '.[advanced]'")
+    logging.debug(f"Optional dashboard dependencies not available: {e}")
+    logging.debug("For dashboard functionality, please install: pip install -e '.[advanced]'")
 
 # Utilities
 from .download_models import download_zenodo_model, download_zenodo_zip, extract_zip
