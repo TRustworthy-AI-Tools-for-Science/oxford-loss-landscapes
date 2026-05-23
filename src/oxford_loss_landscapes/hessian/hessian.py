@@ -66,21 +66,23 @@ def get_eigenstuff(hessian, num_eigs_returned=2, method='numpy'):
     return eigenvalues, eigenvectors
 
 def get_hessian(model, loss, method='numpy'):
-    """Function that calculates the Hessian matrix for a given model and loss value"""
+    """Return the Hessian for a given model and pre-computed loss.
+
+    For small models (< 1 000 params) returns a dense numpy ndarray.
+    For medium models (< 1e10 params) returns a scipy LinearOperator that
+    supports Hessian-vector products; pass it directly to ``get_eigenstuff``
+    or ``scipy.sparse.linalg.eigsh``.
+    """
 
     n_params = sum(p.numel() for p in model.parameters())
     if n_params < SMALL_MATRIX_SIZE:
-        # For small models, use direct Hessian computation
-        hessian = small_hessian(model, loss, method=method)
-        return hessian
+        return small_hessian(model, loss, method=method)
     elif n_params < LARGE_MATRIX_SIZE:
-        # For medium models, use Hessian-vector product
         if isinstance(loss, (int, float)):
             loss = torch.tensor(loss, requires_grad=True)
         elif not loss.requires_grad:
             loss.requires_grad_(True)
-        hessian = hessian_vector_product(net=model, loss=loss, use_cuda=False, all_params=True)
-        return hessian
+        return hessian_vector_product(net=model, loss=loss, use_cuda=False, all_params=True)
     else:
         raise NotImplementedError("Hessian computation for very large models not implemented.")
     
@@ -151,7 +153,7 @@ def small_hessian(model, loss, num_eigs_returned=2, method='numpy'):
         grad2_flat = torch.cat(processed_grad2)
         hessian_rows.append(grad2_flat)
 
-    hessian = torch.stack(hessian_rows).detach().numpy()
+    hessian = torch.stack(hessian_rows).detach().cpu().numpy()
     return hessian
 
 

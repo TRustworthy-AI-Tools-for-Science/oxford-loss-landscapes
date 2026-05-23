@@ -68,7 +68,13 @@ except ImportError:
     pass
 
 # Hessian utilities — VR-PCA eigensolver
-from .hessian.vrpca import VRPCAConfig, VRPCAResult, top_hessian_eigenpair_vrpca, min_max_hessian_eigs_vrpca
+from .hessian.vrpca import (
+    VRPCAConfig,
+    VRPCAResult,
+    top_hessian_eigenpair_vrpca,
+    min_hessian_eigenpair_vrpca,
+    min_max_hessian_eigs_vrpca,
+)
 
 # Utilities
 from .download_models import download_zenodo_model, download_zenodo_zip, extract_zip
@@ -88,6 +94,7 @@ __all__ = [
     "VRPCAConfig",
     "VRPCAResult",
     "top_hessian_eigenpair_vrpca",
+    "min_hessian_eigenpair_vrpca",
     "min_max_hessian_eigs_vrpca",
     "download_zenodo_model",
     "download_zenodo_zip",

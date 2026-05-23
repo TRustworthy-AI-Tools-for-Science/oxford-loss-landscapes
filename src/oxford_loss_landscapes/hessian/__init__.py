@@ -19,6 +19,7 @@ from .hessian_trace import hessian_trace
 from .vrpca import (
     VRPCAConfig,
     VRPCAResult,
+    min_hessian_eigenpair_vrpca,
     min_max_hessian_eigs_vrpca,
     top_hessian_eigenpair_vrpca,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "VRPCAConfig",
     "VRPCAResult",
     "top_hessian_eigenpair_vrpca",
+    "min_hessian_eigenpair_vrpca",
     "min_max_hessian_eigs_vrpca",
     "get_eigenstuff",
     "get_hessian",

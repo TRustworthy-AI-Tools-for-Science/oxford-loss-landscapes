@@ -92,8 +92,8 @@ class GeneralModelWrapper(ModelWrapper):
 
 def wrap_model(model):
     if isinstance(model, ModelWrapper):
-        return model.requires_grad_(False)
+        return model
     elif isinstance(model, torch.nn.Module):
-        return SimpleModelWrapper(model).requires_grad_(False)
+        return SimpleModelWrapper(model)
     else:
         raise ValueError('Only models of type torch.nn.modules.module.Module can be passed without a wrapper.')
