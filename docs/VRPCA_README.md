@@ -61,19 +61,20 @@ source /home/alok/miniconda3/bin/activate Oxford_RSC  # or: conda activate Oxfor
 python examples/simple_hessian_vrpca_analysis.py
 ```
 
-## 4. Research utilities (`vr_pca/`)
+## 4. Research utilities
 
 These scripts leverage the packaged VR-PCA implementation to reproduce scaling
 studies and generate CSV outputs for plotting or further post-processing:
 
 | Script | What it does | Example command |
 |--------|--------------|-----------------|
-| `hessian_scaling.py` | Compare VR-PCA against classical eigsh on a synthetic MLP. | `python vr_pca/hessian_scaling.py --solver both --width 64 --samples 512` |
-| `scaling_analysis.py` | Sweep multiple widths/dataset sizes, saving results to CSV. | `python vr_pca/scaling_analysis.py --widths 64 128 --samples 512 1024 --output results.csv` |
-| `combined_scaling_analysis.py` | Aggregate one or more CSVs into summary tables. | `python vr_pca/combined_scaling_analysis.py results.csv --output summary.csv` |
+| `examples/vrpca_benchmark.py` | Compare VR-PCA against classical eigsh on a synthetic MLP. | `python examples/vrpca_benchmark.py --solver both --width 64 --samples 512` |
+| `scripts/scaling_analysis.py` | Fit power-law scaling curves and visualise runtime vs accuracy. | `python scripts/scaling_analysis.py results.csv --plot-type all` |
+| `scripts/combined_scaling_analysis.py` | Compact scaling plot with fitted exponents printed to stdout. | `python scripts/combined_scaling_analysis.py results.csv --output summary.png` |
 
 These scripts run entirely with the packaged API—no duplicated VR-PCA logic—so
-updates to the library will automatically propagate.
+updates to the library will automatically propagate. See
+[`docs/vr_pca_research.md`](vr_pca_research.md) for full usage details.
 
 ## 5. Workflow examples
 
@@ -87,9 +88,9 @@ updates to the library will automatically propagate.
 
 ### 5.2 Plot VR-PCA vs classical convergence
 
-1. Run `python vr_pca/scaling_analysis.py --widths 64 128 --samples 1024 --repeats 3 --output scaling.csv`.
-2. Use `combined_scaling_analysis.py` to summarise metrics: average eigenvalue,
-   runtime, and HVP usage.
+1. Adapt `examples/vrpca_benchmark.py` to loop over widths/dataset sizes and write rows to a CSV.
+2. Run `python scripts/scaling_analysis.py scaling.csv --plot-type all` to visualise scaling trends.
+3. Use `scripts/combined_scaling_analysis.py` for a compact view of fitted exponents.
 3. Plot columns from `scaling.csv` using your favourite notebook or tool.
 
 ### 5.3 Integrate into custom analysis

@@ -24,7 +24,7 @@ class ModelParameters:
     """
 
     def __init__(self, parameters: list):
-        if not isinstance(parameters, list) and all(isinstance(p, torch.Tensor) for p in parameters):
+        if not isinstance(parameters, list) or not all(isinstance(p, torch.Tensor) for p in parameters):
             raise AttributeError('Argument to ModelParameter is not a list of torch.Tensor objects.')
 
         self.parameters = parameters
@@ -273,7 +273,7 @@ class ModelParameters:
         Returns the tensor as a flat numpy array.
         :return: a numpy array
         """
-        return np.concatenate([p.numpy().flatten() for p in self.parameters])
+        return np.concatenate([p.detach().cpu().numpy().flatten() for p in self.parameters])
 
     def _get_parameters(self) -> list:
         """
@@ -310,7 +310,7 @@ def rand_n_like(example_vector: ModelParameters) -> ModelParameters:
     new_vector = []
 
     for param in example_vector:
-        new_vector.append(torch.randn(size=param.size(), dtype=example_vector[0].dtype))
+        new_vector.append(torch.randn(size=param.size(), dtype=param.dtype, device=param.device))
 
     return ModelParameters(new_vector)
 

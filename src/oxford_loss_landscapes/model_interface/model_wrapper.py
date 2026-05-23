@@ -39,10 +39,10 @@ class ModelWrapper(abc.ABC):
         return self
 
     def parameters(self):
-        return itertools.chain([module.parameters() for module in self.modules])
+        return itertools.chain.from_iterable(module.parameters() for module in self.modules)
 
     def named_parameters(self):
-        return itertools.chain([module.named_parameters() for module in self.modules])
+        return itertools.chain.from_iterable(module.named_parameters() for module in self.modules)
 
     @abc.abstractmethod
     def forward(self, x):
@@ -69,12 +69,7 @@ class TransformerModelWrapper(ModelWrapper):
             return self.model(**encoded)
 
     def get_module_parameters(self):
-        # Filter out embedding parameters if needed for stability
-        params = []
-        for name, param in self.model.named_parameters():
-            if 'embedding' not in name.lower():  # Optional: exclude embeddings
-                params.append(param)
-        return ModelParameters(params)
+        return ModelParameters(list(self.model.parameters()))
 
 
 class SimpleModelWrapper(ModelWrapper):

@@ -36,10 +36,20 @@ class LossGradient(Metric):
         self.target = target
 
     def __call__(self, model_wrapper: ModelWrapper) -> np.ndarray:
-        loss = self.loss_fn(model_wrapper.forward(self.inputs), self.target)
-        gradient = torch.autograd.grad(loss, model_wrapper.named_parameters()).detach().numpy()
-        model_wrapper.zero_grad()
-        return gradient
+        params = list(model_wrapper.get_module_parameters()._get_parameters())
+        for p in params:
+            p.requires_grad_(True)
+        try:
+            with torch.enable_grad():
+                loss = self.loss_fn(model_wrapper.forward(self.inputs), self.target)
+                grads = torch.autograd.grad(loss, params, allow_unused=True)
+            return np.concatenate([
+                (g.detach().cpu().numpy() if g is not None else np.zeros(p.numel(), dtype=np.float32)).flatten()
+                for g, p in zip(grads, params)
+            ])
+        finally:
+            for p in params:
+                p.requires_grad_(False)
 
 
 class LossPerturbations(Metric):

@@ -11,7 +11,7 @@ from tqdm import trange
 
 
 from .model_interface.model_wrapper import ModelWrapper, wrap_model
-from .model_interface.model_parameters import rand_n_like, orthogonal_to
+from .model_interface.model_parameters import ModelParameters, rand_n_like, orthogonal_to
 from .metrics.metric import Metric
 
 
@@ -31,11 +31,12 @@ def _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_wrapper,
         data_column = []
 
         for _ in range(steps):
-            # for every other column, reverse the order in which the column is generated
-            # so you can easily use in-place operations to move along dir_two
+            # Snake traversal: even columns go forward along dir_two, odd go backward.
+            # Evaluate BEFORE moving on even columns so both column types sample the same
+            # row offsets {0, 1, ..., steps-1} and the grid center aligns with the model.
             if i % 2 == 0:
-                start_point.add_(dir_two)
                 data_column.append(metric(model_wrapper))
+                start_point.add_(dir_two)
             else:
                 start_point.sub_(dir_two)
                 data_column.insert(0, metric(model_wrapper))
@@ -278,6 +279,84 @@ def planar_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper
     dir_two.truediv_(steps / 2)
 
     return _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_start_wrapper)
+
+
+def hessian_plane(
+    model: typing.Union[torch.nn.Module, ModelWrapper],
+    metric: Metric,
+    criterion,
+    inputs,
+    targets,
+    *,
+    distance: float = 1.0,
+    steps: int = 20,
+    deepcopy_model: bool = False,
+    vrpca_config=None,
+    export: bool = False,
+) -> np.ndarray:
+    """
+    Returns the computed value of the evaluation function along a planar subspace
+    spanned by the dominant Hessian eigenvector (computed via VR-PCA) and a random
+    orthogonal direction.
+
+    This is the recommended way to visualize loss landscapes around a trained model,
+    since the Hessian eigenvector points in the direction of greatest curvature.
+
+    :param model: model whose current parameters define the centre of the plane
+    :param metric: Metric object used to evaluate the model
+    :param criterion: loss function used to compute the Hessian (e.g. nn.CrossEntropyLoss())
+    :param inputs: input tensor(s) passed to the model for Hessian computation
+    :param targets: target tensor(s) for the loss function
+    :param distance: maximum distance from the centre in each direction
+    :param steps: grid resolution (steps x steps evaluations)
+    :param deepcopy_model: if True, deepcopy the model before perturbing
+    :param vrpca_config: VRPCAConfig instance; uses sensible defaults if None
+    :param export: if True, write the result to a .npy file instead of returning it
+    :return: (steps x steps) numpy array of metric values, or None if export=True
+    """
+    from .hessian.vrpca import top_hessian_eigenpair_vrpca, VRPCAConfig
+    from .hessian.vrpca.utils import unflatten_like
+
+    # Extract raw nn.Module BEFORE wrap_model, because wrap_model disables requires_grad
+    # and VR-PCA needs differentiable parameters.
+    if isinstance(model, ModelWrapper):
+        raw_module = model.modules[0]
+    else:
+        raw_module = model
+
+    cfg = vrpca_config or VRPCAConfig()
+    result = top_hessian_eigenpair_vrpca(
+        net=raw_module,
+        inputs=inputs,
+        targets=targets,
+        criterion=criterion,
+        config=cfg,
+    )
+
+    model_wrapper = wrap_model(copy.deepcopy(model) if deepcopy_model else model)
+    start_point = model_wrapper.get_module_parameters()
+    params_ref = start_point._get_parameters()
+
+    # Reshape the flat eigenvector into per-parameter tensors
+    eigvec_list = unflatten_like(result.eigenvector.detach(), params_ref)
+    dir_one = ModelParameters(eigvec_list)
+
+    # Second direction: random vector orthogonal to the eigenvector
+    dir_two = orthogonal_to(dir_one)
+
+    # Scale both directions to cover `distance` over the full grid
+    dir_one.mul_(((start_point.model_norm() * distance) / steps) / dir_one.model_norm())
+    dir_two.mul_(((start_point.model_norm() * distance) / steps) / dir_two.model_norm())
+
+    # Shift start to the corner so the original params sit at the grid centre
+    dir_one.mul_(steps / 2)
+    dir_two.mul_(steps / 2)
+    start_point.sub_(dir_one)
+    start_point.sub_(dir_two)
+    dir_one.truediv_(steps / 2)
+    dir_two.truediv_(steps / 2)
+
+    return _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_wrapper, distance, export)
 
 
 def random_plane(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric, distance=1, steps=20,

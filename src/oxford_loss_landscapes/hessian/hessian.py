@@ -18,38 +18,47 @@ LARGE_MATRIX_SIZE = int(1e10)
 ################################################################################
 
 def get_eigenstuff(hessian, num_eigs_returned=2, method='numpy'):
-    """Calculate eigenvalues and eigenvectors of a Hessian matrix"""
-    
+    """Calculate eigenvalues and eigenvectors of a Hessian matrix or LinearOperator."""
+    from scipy.sparse.linalg import LinearOperator as SciPyLinearOperator
+
+    # LinearOperator (e.g. from hessian_vector_product for medium models) must use eigsh
+    if isinstance(hessian, SciPyLinearOperator):
+        n = hessian.shape[0]
+        if n < num_eigs_returned:
+            raise ValueError(f"Operator size {n} too small for {num_eigs_returned} eigenvalues.")
+        eigenvalues, eigenvectors = eigsh(hessian, k=num_eigs_returned, which='LM', tol=1e-2)
+        eigenvalues = [float(ev) for ev in eigenvalues]
+        eigenvectors = [eigenvectors[:, i] for i in range(eigenvectors.shape[1])]
+        return eigenvalues, eigenvectors
+
     if method == 'numpy':
         # Warn for very large matrices
         if hessian.shape[0] > LARGE_MATRIX_SIZE:
             warnings.warn("Matrix is very large for numpy.linalg.eig. Consider using method='scipy'.")
-            
+
         # Use eigh for symmetric Hessians to guarantee real eigenvalues/vectors
         eigenvalues, eigenvectors = LA.eigh(hessian)
-        
+
         # Sort eigenvalues in ascending order and select the largest num_eigs_returned
         sorted_indices = np.argsort(eigenvalues)[-num_eigs_returned:]
         eigenvalues = [float(eigenvalues[i]) for i in sorted_indices]
         eigenvectors = [eigenvectors[:, i].flatten() for i in sorted_indices]
-        
+
     elif method == 'scipy':
         # Validation checks
         if hessian.shape[0] != hessian.shape[1]:
             raise ValueError("Matrix must be square for scipy eigsh decomposition.")
         if hessian.shape[0] < num_eigs_returned:
             raise ValueError(f"Matrix size {hessian.shape[0]} too small for {num_eigs_returned} eigenvalues.")
-            
+
         # Warn for edge cases
         if hessian.shape[0] < 10 * num_eigs_returned:
             warnings.warn(f"Matrix size {hessian.shape[0]} small relative to requested eigenvalues. "
                          "Consider method='numpy' for better accuracy.")
-                         
+
         eigenvalues, eigenvectors = eigsh(hessian, k=num_eigs_returned, which='LM', tol=1e-2)
         eigenvalues = [float(ev) for ev in eigenvalues]
         eigenvectors = [eigenvectors[:, i] for i in range(eigenvectors.shape[1])]
-        
-        # Keep eigenvectors as numpy arrays for consistency with test expectations
 
     elif method == 'vrpca':
         raise NotImplementedError("VR-PCA method not implemented in this function.")

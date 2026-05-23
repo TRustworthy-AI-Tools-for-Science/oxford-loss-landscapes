@@ -44,6 +44,7 @@ from .main import (
     random_line,
     planar_interpolation,
     random_plane,
+    hessian_plane,
 )
 
 # Model interface
@@ -66,20 +67,28 @@ except ImportError:
     # Install with: pip install -e ".[advanced]"
     pass
 
+# Hessian utilities — VR-PCA eigensolver
+from .hessian.vrpca import VRPCAConfig, VRPCAResult, top_hessian_eigenpair_vrpca, min_max_hessian_eigs_vrpca
+
 # Utilities
 from .download_models import download_zenodo_model, download_zenodo_zip, extract_zip
 
 __all__ = [
     "point",
-    "linear_interpolation", 
+    "linear_interpolation",
     "random_line",
     "planar_interpolation",
     "random_plane",
+    "hessian_plane",
     "ModelWrapper",
     "GeneralModelWrapper",
     "SimpleModelWrapper",
     "TransformerModelWrapper",
     "rand_u_like",
+    "VRPCAConfig",
+    "VRPCAResult",
+    "top_hessian_eigenpair_vrpca",
+    "min_max_hessian_eigs_vrpca",
     "download_zenodo_model",
     "download_zenodo_zip",
     "extract_zip",
