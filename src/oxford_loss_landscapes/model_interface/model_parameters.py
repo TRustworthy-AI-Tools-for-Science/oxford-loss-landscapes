@@ -85,8 +85,9 @@ class ModelParameters:
         :param other: model parameters to add
         :return: none
         """
-        for idx in range(len(self)):
-            self.parameters[idx] += other[idx]
+        with torch.no_grad():
+            for idx in range(len(self)):
+                self.parameters[idx] += other[idx]
 
     def __sub__(self, other: 'ModelParameters') -> 'ModelParameters':
         """
@@ -110,8 +111,9 @@ class ModelParameters:
         :param vector: other to subtract
         :return: none
         """
-        for idx in range(len(self)):
-            self.parameters[idx] -= vector[idx]
+        with torch.no_grad():
+            for idx in range(len(self)):
+                self.parameters[idx] -= vector[idx]
 
     def __mul__(self, scalar) -> 'ModelParameters':
         """
@@ -135,8 +137,9 @@ class ModelParameters:
         :param scalar: scalar to multiply by
         :return: none
         """
-        for idx in range(len(self)):
-            self.parameters[idx] *= scalar
+        with torch.no_grad():
+            for idx in range(len(self)):
+                self.parameters[idx] *= scalar
 
     def __truediv__(self, scalar) -> 'ModelParameters':
         """
@@ -152,8 +155,9 @@ class ModelParameters:
         :param scalar: scalar to divide by
         :return: none
         """
-        for idx in range(len(self)):
-            self.parameters[idx] /= scalar
+        with torch.no_grad():
+            for idx in range(len(self)):
+                self.parameters[idx] /= scalar
 
     def __floordiv__(self, scalar) -> 'ModelParameters':
         """
@@ -169,8 +173,9 @@ class ModelParameters:
         :param scalar: scalar to divide by
         :return: none
         """
-        for idx in range(len(self)):
-            self.parameters[idx] //= scalar
+        with torch.no_grad():
+            for idx in range(len(self)):
+                self.parameters[idx] //= scalar
 
     def __matmul__(self, other: 'ModelParameters') -> 'ModelParameters':
         """
@@ -198,8 +203,9 @@ class ModelParameters:
         :param order: norm order, e.g. 2 for L2 norm
         :return: none
         """
-        for parameter in self.parameters:
-            parameter *= (ref_point.model_norm(order) / self.model_norm())
+        with torch.no_grad():
+            for parameter in self.parameters:
+                parameter *= (ref_point.model_norm(order) / self.model_norm())
 
     def layer_normalize_(self, ref_point: 'ModelParameters', order=2):
         """
@@ -208,9 +214,9 @@ class ModelParameters:
         :param order: norm order, e.g. 2 for L2 norm
         :return: none
         """
-        # in-place normalize each parameter
-        for layer_idx, parameter in enumerate(self.parameters, 0):
-            parameter *= (ref_point.layer_norm(layer_idx, order) / self.layer_norm(layer_idx, order))
+        with torch.no_grad():
+            for layer_idx, parameter in enumerate(self.parameters, 0):
+                parameter *= (ref_point.layer_norm(layer_idx, order) / self.layer_norm(layer_idx, order))
 
     def filter_normalize_(self, ref_point: 'ModelParameters', order=2):
         """
@@ -221,20 +227,21 @@ class ModelParameters:
         """
         eps = 1e-12  # Small epsilon to prevent division by zero
         
-        for l in range(len(self.parameters)):
-            # normalize one-dimensional bias vectors
-            if len(self.parameters[l].size()) == 1:
-                ref_norm = ref_point.parameters[l].norm(order)
-                self_norm = self.parameters[l].norm(order)
-                if self_norm > eps:
-                    self.parameters[l] *= (ref_norm / self_norm)
-            # normalize two-dimensional weight vectors
-            else:
-                for f in range(len(self.parameters[l])):
-                    ref_filter_norm = ref_point.filter_norm((l, f), order)
-                    self_filter_norm = self.filter_norm((l, f), order)
-                    if self_filter_norm > eps:
-                        self.parameters[l][f] *= ref_filter_norm / self_filter_norm
+        with torch.no_grad():
+            for l in range(len(self.parameters)):
+                # normalize one-dimensional bias vectors
+                if len(self.parameters[l].size()) == 1:
+                    ref_norm = ref_point.parameters[l].norm(order)
+                    self_norm = self.parameters[l].norm(order)
+                    if self_norm > eps:
+                        self.parameters[l] *= (ref_norm / self_norm)
+                # normalize two-dimensional weight vectors
+                else:
+                    for f in range(len(self.parameters[l])):
+                        ref_filter_norm = ref_point.filter_norm((l, f), order)
+                        self_filter_norm = self.filter_norm((l, f), order)
+                        if self_filter_norm > eps:
+                            self.parameters[l][f] *= ref_filter_norm / self_filter_norm
 
     def model_norm(self, order=2) -> float:
         """
