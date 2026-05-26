@@ -28,6 +28,8 @@ Example:
     >>> landscape = oll.random_plane(model_wrapper, distance=1.0, steps=51)
 """
 
+import logging
+
 try:
     from ._version import __version__
 except ImportError:
@@ -62,10 +64,11 @@ try:
     import streamlit
     import plotly
     from .dashboard import *
-except ImportError:
+except ImportError as e:
     # Dashboard dependencies (streamlit, plotly) not available
     # Install with: pip install -e ".[advanced]"
-    pass
+    logging.debug("Optional dashboard dependencies not available: %s", e)
+    logging.debug("For dashboard functionality, please install: pip install -e '.[advanced]'")
 
 # Hessian utilities — VR-PCA eigensolver
 from .hessian.vrpca import (

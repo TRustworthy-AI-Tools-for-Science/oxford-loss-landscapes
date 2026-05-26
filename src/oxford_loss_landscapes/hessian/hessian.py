@@ -418,7 +418,8 @@ def create_hessian_vector_product(net, inputs, outputs, criterion, use_cuda=Fals
     return hess_vec_prod, params, N
 
 
-def min_max_hessian_eigs(net, inputs, outputs, criterion, rank=0, use_cuda=False, verbose=False, all_params=True):
+def min_max_hessian_eigs(net, inputs, outputs, criterion, rank=0, use_cuda=False, verbose=False, all_params=True,
+                         backend=None, vrpca_config=None, compute_min=False):
     """
         Compute the largest and the smallest eigenvalues of the Hessian marix.
 
@@ -439,7 +440,19 @@ def min_max_hessian_eigs(net, inputs, outputs, criterion, rank=0, use_cuda=False
             mineigvec: min eigenvector
             hess_vec_prod.count: number of iterations for calculating max and min eigenvalues
     """
-    
+    if backend == "vrpca":
+        from oxford_loss_landscapes.hessian.vrpca.api import min_max_hessian_eigs_vrpca
+        return min_max_hessian_eigs_vrpca(
+            net=net,
+            inputs=inputs,
+            targets=outputs,
+            criterion=criterion,
+            all_params=all_params,
+            use_cuda=use_cuda,
+            config=vrpca_config,
+            compute_min=compute_min,
+        )
+
     # Create the Hessian-vector product function
     hess_vec_prod, params, N = create_hessian_vector_product(
         net, inputs, outputs, criterion, use_cuda, all_params
