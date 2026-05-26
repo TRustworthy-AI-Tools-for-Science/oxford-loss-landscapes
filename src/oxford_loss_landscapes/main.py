@@ -2,17 +2,25 @@
 Functions for approximating loss/return landscapes in one and two dimensions.
 """
 import copy
+import multiprocessing
+import os
+import traceback
+import datetime
 import typing
 import torch.nn
 import numpy as np
-import os
-import datetime
 from tqdm import trange
 
+try:
+    import ray
+except ImportError:
+    ray = None
 
 from .model_interface.model_wrapper import ModelWrapper, wrap_model
 from .model_interface.model_parameters import ModelParameters, rand_n_like, orthogonal_to
 from .metrics.metric import Metric
+
+USE_PARALLEL = False
 
 
 def _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_wrapper, distance=1.0, export=False):
@@ -57,18 +65,109 @@ def _export_plane_to_npy(data_matrix, distance):
     os.makedirs(results_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{timestamp}_LOLxAI"
-    
-    # Save distance to toml manually
+
     toml_filename = f"{filename}.toml"
-    with open(os.path.join(results_dir, toml_filename), "w") as f:
+    with open(os.path.join(results_dir, toml_filename), "w", encoding="utf-8") as f:
         f.write(f'distance = {float(distance)}\n')
-    
-    # Save landscape data to npy
+
     data_filename = f"{filename}.npy"
     data_file_path = os.path.join(results_dir, data_filename)
     np.save(data_file_path, data_matrix)
 
     print(f"Saved plane data to {data_file_path}")
+
+
+def _evaluate_plane_parallel(
+    start_point, dir_one, dir_two, steps, metric, model_wrapper,
+    distance=1.0, export=False, num_workers=None,
+):
+    """Parallel version of _evaluate_plane using Ray remote workers.
+
+    Each row of the evaluation grid is dispatched to an independent Ray worker.
+    Falls back to sequential evaluation if Ray is unavailable or fails.
+    """
+    def _sequential_eval(sp, d1, d2, steps_, metric_, wrapper_):
+        data_matrix = []
+        for i in range(int(steps_)):
+            data_column = []
+            for _ in range(int(steps_)):
+                if i % 2 == 0:
+                    sp.add_(d2)
+                    data_column.append(metric_(wrapper_))
+                else:
+                    sp.sub_(d2)
+                    data_column.insert(0, metric_(wrapper_))
+            data_matrix.append(data_column)
+            sp.add_(d1)
+        return np.array(data_matrix)
+
+    if ray is None or not ray.is_initialized():
+        try:
+            if ray is not None:
+                ray.init(ignore_reinit_error=True)
+        except Exception:
+            return _sequential_eval(start_point, dir_one, dir_two, steps, metric, model_wrapper)
+
+    if ray is None:
+        return _sequential_eval(start_point, dir_one, dir_two, steps, metric, model_wrapper)
+
+    try:
+        available_cpus = int(ray.available_resources().get("CPU", multiprocessing.cpu_count()))
+    except Exception:
+        available_cpus = multiprocessing.cpu_count()
+
+    if num_workers is None:
+        num_workers = min(steps, max(1, available_cpus))
+
+    @ray.remote
+    def eval_row(row_start_params, dir_two_params, steps_, metric_fn, wrapper_, row_idx):
+        local_wrapper = copy.deepcopy(wrapper_)
+        local_params = local_wrapper.get_module_parameters()
+        for idx in range(len(local_params)):
+            local_params.parameters[idx].data = row_start_params[idx].clone()
+        data_column = []
+        for _ in range(int(steps_)):
+            if row_idx % 2 == 0:
+                for idx in range(len(local_params)):
+                    local_params.parameters[idx].data = (
+                        local_params.parameters[idx].data + dir_two_params[idx]
+                    )
+            else:
+                for idx in range(len(local_params)):
+                    local_params.parameters[idx].data = (
+                        local_params.parameters[idx].data - dir_two_params[idx]
+                    )
+            val = metric_fn(local_wrapper)
+            if row_idx % 2 == 0:
+                data_column.append(val)
+            else:
+                data_column.insert(0, val)
+        return data_column
+
+    row_params = []
+    current = start_point
+    dir_two_data = [p.data.clone().detach() for p in dir_two]
+    for i in range(int(steps)):
+        row_params.append([p.data.clone().detach() for p in current])
+        current = current + dir_one
+
+    tasks = [
+        eval_row.remote(row_params[i], dir_two_data, steps, metric, model_wrapper, i)
+        for i in range(int(steps))
+    ]
+
+    try:
+        results = ray.get(tasks)
+    except Exception:
+        print("Warning: Ray remote execution failed, falling back to sequential evaluation.")
+        traceback.print_exc()
+        return _sequential_eval(start_point, dir_one, dir_two, steps, metric, model_wrapper)
+
+    data_matrix = np.array(results)
+    if export:
+        _export_plane_to_npy(data_matrix, distance)
+    else:
+        return data_matrix
 
 
 def point(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric) -> tuple:
@@ -216,7 +315,8 @@ def random_line(model_start: typing.Union[torch.nn.Module, ModelWrapper], metric
 def planar_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper],
                          model_end_one: typing.Union[torch.nn.Module, ModelWrapper],
                          model_end_two: typing.Union[torch.nn.Module, ModelWrapper],
-                         metric: Metric, distance=1.0, steps=20, deepcopy_model=False, eigen_models = False) -> np.ndarray:
+                         metric: Metric, distance=1.0, steps=20, deepcopy_model=False,
+                         eigen_models=False, use_ray=False, num_workers=None) -> np.ndarray:
     """
     Returns the computed value of the evaluation function applied to the model or agent along
     a planar subspace of the parameter space defined by a start point and two end points.
@@ -278,6 +378,8 @@ def planar_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper
     dir_one.truediv_(steps / 2)
     dir_two.truediv_(steps / 2)
 
+    if use_ray or USE_PARALLEL:
+        return _evaluate_plane_parallel(start_point, dir_one, dir_two, steps, metric, model_start_wrapper, num_workers=num_workers)
     return _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_start_wrapper)
 
 
@@ -360,7 +462,8 @@ def hessian_plane(
 
 
 def random_plane(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric, distance=1, steps=20,
-                 normalization='filter', deepcopy_model=False, export=False) -> np.ndarray:
+                 normalization='filter', deepcopy_model=False, export=False,
+                 use_ray=False, num_workers=None) -> np.ndarray:
     """
     Returns the computed value of the evaluation function applied to the model or agent along a planar
     subspace of the parameter space defined by a start point and two randomly sampled directions.
@@ -430,5 +533,7 @@ def random_plane(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Met
     dir_one.truediv_(steps / 2)
     dir_two.truediv_(steps / 2)
 
+    if use_ray or USE_PARALLEL:
+        return _evaluate_plane_parallel(start_point, dir_one, dir_two, steps, metric, model_start_wrapper, distance, export, num_workers)
     return _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_start_wrapper, distance, export)
 
