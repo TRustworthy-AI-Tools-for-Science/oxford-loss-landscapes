@@ -55,5 +55,5 @@ Installation with requirements.txt
 Python Version Compatibility
 ----------------------------
 
-- **Python 3.8–3.12**: Uses PyTorch >=1.8.0 and NumPy <2.0
-- **Python 3.13+**: Uses PyTorch >=2.5.0 and NumPy >=2.0 (automatic version selection)
+- **Python 3.10–3.12**: Uses PyTorch >=1.8.0 and NumPy <2.0
+- **Python 3.13**: Uses PyTorch >=2.5.0 and NumPy >=2.0 (automatic version selection)

@@ -1,7 +1,7 @@
 Requirements
 ============
 
-- Python >=3.8 (Python 3.12 recommended for best compatibility)
+- Python >=3.10 (Python 3.12 recommended for best compatibility)
 - pip package manager
 
 All other dependencies are automatically installed, including:

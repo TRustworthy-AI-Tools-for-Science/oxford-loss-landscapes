@@ -9,111 +9,168 @@ Quick Start
    import torch
    import torch.nn as nn
    import oxford_loss_landscapes as oll
+   from oxford_loss_landscapes.metrics import Loss
 
-   # Create a simple model and loss function
+   # Define a simple model
    model = nn.Sequential(
        nn.Linear(10, 5),
        nn.ReLU(),
-       nn.Linear(5, 1)
+       nn.Linear(5, 1),
    )
+
+   inputs = torch.randn(32, 10)
+   targets = torch.randn(32, 1)
+
+   # Wrap the model and define a metric
+   model_wrapper = oll.SimpleModelWrapper(model)
+   metric = Loss(nn.MSELoss(), inputs, targets)
+
+   # Evaluate loss at current parameters
+   loss_value = oll.point(model_wrapper, metric)
+   print(f"Current loss: {loss_value:.4f}")
+
+   # Compute a random 2-D loss landscape (25x25 grid)
+   landscape = oll.random_plane(model_wrapper, metric, distance=1.0, steps=25)
+   print(f"Landscape shape: {landscape.shape}")  # (25, 25)
+
+Linear Interpolation
+--------------------
+
+Interpolate loss between two checkpoints:
+
+.. code-block:: python
+
+   import copy
+
+   model_end = copy.deepcopy(model)
+   # ... train model_end further ...
+
+   wrapper_start = oll.SimpleModelWrapper(model)
+   wrapper_end   = oll.SimpleModelWrapper(model_end)
+
+   line = oll.linear_interpolation(wrapper_start, wrapper_end, metric,
+                                   distance=1.0, steps=50)
+
+Parallel Plane Evaluation
+--------------------------
+
+Use Ray to evaluate landscape rows in parallel:
+
+.. code-block:: python
+
+   plane = oll.random_plane(
+       model_wrapper, metric,
+       distance=1.0, steps=25,
+       normalization='filter',
+       use_ray=True,
+       num_workers=4,
+   )
+
+Hessian-Aligned Plane
+----------------------
+
+Visualise loss in the directions of sharpest curvature:
+
+.. code-block:: python
+
    criterion = nn.MSELoss()
+   loss = criterion(model(inputs), targets)
 
-   # Generate some dummy data
-   inputs = torch.randn(100, 10)
-   targets = torch.randn(100, 1)
+   plane = oll.hessian_plane(model_wrapper, metric, loss=loss,
+                             steps=15, distance=0.5)
 
-   # Wrap the model
-   model_wrapper = oll.ModelWrapper(model, criterion, inputs, targets)
+Hessian Eigenvalues - Classical Solver
+---------------------------------------
 
-   # Compute a random 2D loss landscape
-   landscape = oll.random_plane(model_wrapper, distance=1.0, steps=25)
-   print(f"Loss landscape shape: {landscape.shape}")
+.. code-block:: python
 
-   # Compute loss at current parameters
-   loss_value = oll.point(model_wrapper)
-   print(f"Current loss: {loss_value}")
+   from oxford_loss_landscapes.hessian import min_max_hessian_eigs
 
+   max_eig, min_eig, max_vec, min_vec, iters = min_max_hessian_eigs(
+       net=model,
+       inputs=inputs,
+       outputs=targets,
+       criterion=nn.MSELoss(),
+   )
+   print(f"max eigenvalue = {max_eig:.4f},  min eigenvalue = {min_eig:.4f}")
+
+Hessian Eigenvalues - VR-PCA Solver
+-------------------------------------
+
+The VR-PCA solver is more memory-efficient for large models:
+
+.. code-block:: python
+
+   import oxford_loss_landscapes as oll
+
+   config = oll.VRPCAConfig(batch_size=64, epochs=20, tol=1e-4)
+
+   # Largest eigenpair
+   result = oll.top_hessian_eigenpair_vrpca(
+       net=model, inputs=inputs, targets=targets,
+       criterion=nn.MSELoss(), config=config,
+   )
+   print(f"max eigenvalue ~ {result.eigenvalue:.4f}  (converged={result.converged})")
+
+   # Smallest eigenpair
+   min_result = oll.min_hessian_eigenpair_vrpca(
+       net=model, inputs=inputs, targets=targets,
+       criterion=nn.MSELoss(), config=config,
+   )
+   print(f"min eigenvalue ~ {min_result.eigenvalue:.4f}")
+
+Hessian Trace
+-------------
+
+.. code-block:: python
+
+   from oxford_loss_landscapes.hessian import hessian_trace
+
+   trace = hessian_trace(model, nn.MSELoss(), inputs, targets,
+                         num_random_vectors=10)
+   print(f"Hessian trace ~ {trace:.4f}")
 
 Dashboard Example
-=================
+-----------------
 
-This example demonstrates how to generate and explore an **interactive loss landscape dashboard**.
+Generate an export then launch the interactive Dash dashboard.
 
-The script used is ``cnn_usage.py`` from the ``examples`` directory.
-
-Step 1: Generate the 2D Plane with Export
------------------------------------------
-
-To use the interactive dashboard, the calculation of the 2D plane must include the ``export=True`` argument.
-The current example has been modified to include this argument in the call to ``random_plane``, like so:
+**Step 1 - generate the plane with export:**
 
 .. code-block:: python
 
    plane_losses = oll.random_plane(
-       model_wrapper,
-       loss_metric,
-       distance=1.0,
-       steps=21,
+       model_wrapper, metric,
+       distance=1.0, steps=21,
        normalization='model',
-       export=True
+       export=True,
    )
 
-This will generate a **results** directory in the location where the script is run.
+This writes a ``.npy`` file and a ``.toml`` config into a ``results/``
+directory in the current working directory.
 
 .. note::
 
-   If you only add the ``export=True`` modification to the basic example without adapting the rest of the code,
-   you may encounter the following error:
+   When ``export=True``, ``random_plane`` returns ``None`` instead of an
+   array -- results are written to disk for use with the dashboard.
 
-   .. code-block:: text
-
-      AttributeError: 'NoneType' object has no attribute 'shape'
-
-   This occurs because ``random_plane`` does not return data when ``export=True`` — instead, results are written
-   to the generated directory for use with the dashboard.
-
-
-Step 2: Launch the Dashboard
-----------------------------
-
-Once the results directory has been generated, launch the dashboard from the same directory:
+**Step 2 - launch the dashboard:**
 
 .. code-block:: bash
 
-   python ./oxford_rse_project4/src/oxford_loss_landscapes/dashboard/gui_loss_dash.py
+   python -m oxford_loss_landscapes.dashboard.gui_loss_dash
 
-Typical output may look like:
+Typical output::
 
-.. code-block:: text
-
-   /usr/local/anaconda3/envs/charmm/lib/python3.13/site-packages/dash/dash.py:22: UserWarning: pkg_resources is deprecated as an API...
    Dash is running on http://127.0.0.1:8097/
 
-   * Serving Flask app 'gui_loss_dash'
-   * Debug mode: on
+**Step 3 - explore:**
 
-Click on the ``http://127.0.0.1:8097/`` link to open the dashboard in your browser.
-
-Step 3: Explore the Dashboard
------------------------------
-
-The dashboard provides several interactive features, each with icons in the top-right corner of the dashboard:
-
-- **Download PNG** of landscape
-- **Zoom**, **Pan**, **Orbital rotation**, and **Turnable rotation**
-- **Reset to default view** or **reset to last view**
-
-There are two modes:
-
-- **Unbounded view**  
-- **Bounded view** — modified using the sliding bars on the left-hand side (to adjust bounds in two directions and the loss).
-
-Dashboard Screenshot
---------------------
+The dashboard provides zoom, pan, orbital and turntable rotation,
+PNG download, and bounded/unbounded view modes.
 
 .. figure:: _static/dashboard_cnn_usage.png
    :alt: Interactive dashboard view
    :align: center
-   :figclass: align-center
 
-   Users view of the dashboard for ``cnn_usage.py``.
+   Interactive dashboard for a CNN loss landscape.
