@@ -7,19 +7,11 @@ import subprocess
 
 EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples")
 
-# Scripts that require large models or significant GPU/memory — skip in CI
-HEAVY_EXAMPLES = {
-    "hessian_cnn_loss_landscape.py",  # downloads VGG16 (528MB) and computes Hessian on 138M params
-}
-
 example_scripts = glob.glob(os.path.join(EXAMPLES_DIR, "*.py"))
 
 @pytest.mark.parametrize("script_path", example_scripts)
 def test_example_script_runs(script_path):
     """Smoke test: run each example script and check for errors."""
-    if os.path.basename(script_path) in HEAVY_EXAMPLES:
-        pytest.skip(f"Skipping {os.path.basename(script_path)}: requires large model/memory, not suitable for CI")
-
     print(f"Running example: {script_path}")
     result = subprocess.run([sys.executable, script_path], capture_output=True, text=True)
 

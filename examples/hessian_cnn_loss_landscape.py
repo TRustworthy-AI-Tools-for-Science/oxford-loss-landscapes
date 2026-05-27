@@ -13,7 +13,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
 
-from torchvision.models import vgg16
+from torchvision.models import squeezenet1_0
 from torchvision import transforms
 from datasets import load_dataset
 #%%
@@ -33,7 +33,7 @@ except ImportError as e:
 
 def main():
     """Example script to create a Hessian loss landscape for VGG16 using Hessian Eigenvectors"""
-    print("Oxford Loss Landscapes - Example Usage For PyTorch VGG16")
+    print("Oxford Loss Landscapes - Example Usage For PyTorch SqueezeNet")
     print("=" * 40)
 
     print(" ---> IMPORTANT NOTE: This example uses the Maysee/tiny-imagenet dataset from Hugging Face.")
@@ -44,7 +44,7 @@ def main():
 
     # Create model and data
     print("1. Creating model and data...")
-    model = vgg16(weights='IMAGENET1K_V1')
+    model = squeezenet1_0(weights=None)
     _ = model.eval()
 
     # Getting a single image from ImageNet 1k
