@@ -159,6 +159,8 @@ def _export_plane_to_npy(data_matrix, distance):
     toml_filename = f"{filename}.toml"
     with open(os.path.join(results_dir, toml_filename), "w", encoding="utf-8") as f:
         f.write(f'distance = {float(distance)}\n')
+        f.write(f'coordinate_min = {-float(distance)}\n')
+        f.write(f'coordinate_max = {float(distance)}\n')
 
     data_filename = f"{filename}.npy"
     data_file_path = os.path.join(results_dir, data_filename)

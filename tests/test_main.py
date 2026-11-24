@@ -16,6 +16,20 @@ def test_package_import():
     except ImportError as e:
         pytest.skip(f"Package not properly installed: {e}")
 
+
+def test_export_plane_writes_coordinate_bounds(tmp_path, monkeypatch):
+    from oxford_loss_landscapes.main import _export_plane_to_npy
+
+    monkeypatch.chdir(tmp_path)
+    _export_plane_to_npy(np.zeros((3, 3)), distance=0.25)
+
+    config_path = next((tmp_path / "results").glob("*.toml"))
+    config = config_path.read_text(encoding="utf-8")
+
+    assert "coordinate_min = -0.25" in config
+    assert "coordinate_max = 0.25" in config
+
+
 def test_random_plane():
     """Test the random_plane function."""
     try:
