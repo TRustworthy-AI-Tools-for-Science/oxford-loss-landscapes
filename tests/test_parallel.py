@@ -120,3 +120,95 @@ def test_evaluate_plane_parallel():
     assert np.all(plane >= 0.0)  # Loss should be non-negative
 
 
+def test_evaluate_plane_parallel_matches_sequential_for_centered_grids(monkeypatch):
+    import oxford_loss_landscapes.main as main_module
+    from oxford_loss_landscapes.main import _evaluate_plane, _evaluate_plane_parallel
+    from oxford_loss_landscapes.model_interface.model_parameters import ModelParameters
+
+    class InlineRemoteFunction:
+        def __init__(self, function):
+            self.function = function
+
+        def remote(self, *args):
+            return self.function(*args)
+
+    class InlineRay:
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def available_resources():
+            return {"CPU": 2}
+
+        @staticmethod
+        def remote(function):
+            return InlineRemoteFunction(function)
+
+        @staticmethod
+        def get(results):
+            return results
+
+    model_wrapper = SimpleModelWrapper(nn.Linear(1, 1))
+    with torch.no_grad():
+        model_wrapper.get_module_parameters()[0].fill_(0.7)
+        model_wrapper.get_module_parameters()[1].fill_(-0.4)
+
+    start_point = ModelParameters(
+        [
+            parameter.detach().clone()
+            for parameter in model_wrapper.get_module_parameters()
+        ]
+    )
+    dir_one = ModelParameters([torch.tensor([[0.2]]), torch.tensor([-0.3])])
+    dir_two = ModelParameters([torch.tensor([[-0.5]]), torch.tensor([0.4])])
+
+    def asymmetric_metric(wrapper):
+        weight, bias = (
+            float(parameter.item()) for parameter in wrapper.get_module_parameters()
+        )
+        return (
+            2 * weight**2
+            + 3 * bias**2
+            + 5 * weight * bias
+            + 7 * weight
+            - 11 * bias
+            + 13
+        )
+
+    for steps in (3, 4):
+        expected = _evaluate_plane(
+            start_point,
+            dir_one,
+            dir_two,
+            steps,
+            asymmetric_metric,
+            model_wrapper,
+            centered=True,
+        )
+
+        monkeypatch.setattr(main_module, "ray", InlineRay())
+        parallel = _evaluate_plane_parallel(
+            start_point,
+            dir_one,
+            dir_two,
+            steps,
+            asymmetric_metric,
+            model_wrapper,
+            centered=True,
+            num_workers=2,
+        )
+        np.testing.assert_allclose(parallel, expected)
+
+        monkeypatch.setattr(main_module, "ray", None)
+        fallback = _evaluate_plane_parallel(
+            start_point,
+            dir_one,
+            dir_two,
+            steps,
+            asymmetric_metric,
+            model_wrapper,
+            centered=True,
+            num_workers=2,
+        )
+        np.testing.assert_allclose(fallback, expected)
