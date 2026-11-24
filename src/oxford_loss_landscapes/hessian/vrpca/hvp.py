@@ -145,8 +145,12 @@ class HessianVectorProductOracle:
                     "Minibatching graph/dict inputs with dataset_size > 1 requires "
                     "an index-aware `loss_callable`."
                 )
-            xb = _apply_to_device(_select_batch(self.inputs, batch_indices), self.device)
-            yb = _apply_to_device(_select_batch(self.targets, batch_indices), self.device)
+            is_graph_batch = isinstance(self.inputs, dict) or (
+                hasattr(self.inputs, "to") and not isinstance(self.inputs, torch.Tensor)
+            )
+            selection_indices = None if is_graph_batch else batch_indices
+            xb = _apply_to_device(_select_batch(self.inputs, selection_indices), self.device)
+            yb = _apply_to_device(_select_batch(self.targets, selection_indices), self.device)
             outputs = self.forward_fn(self.model, xb) if self.forward_fn is not None else self.model(xb)
             loss = self.loss_fn(outputs, yb) if yb is not None else self.loss_fn(outputs)
 
