@@ -10,10 +10,10 @@ from .types import TensorList, TensorSequence
 
 
 def collect_parameters(model: torch.nn.Module, all_params: bool) -> List[torch.nn.Parameter]:
-    """Return parameters to include in Hessian operations."""
+    """Return differentiable floating-point parameters to include in Hessian operations."""
     selected: List[torch.nn.Parameter] = []
     for param in model.parameters():
-        if not param.requires_grad:
+        if not param.requires_grad or not param.is_floating_point():
             continue
         if all_params or param.dim() > 1:
             selected.append(param)

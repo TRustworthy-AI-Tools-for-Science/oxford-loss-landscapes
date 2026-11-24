@@ -31,15 +31,13 @@ dependencies = [
     "torch>=1.8.0; python_version<'3.13'",
     "torch>=2.5.0; python_version>='3.13'",
     "torchdiffeq>=0.2.0",
-    "numpy>=1.19.0,<2.0; python_version<'3.13'",
-    "numpy>=2.0; python_version>='3.13'",
+    "numpy>=1.19.0",
     "pandas>=1.3.0",
-    "scipy>=1.7.0", 
+    "scipy>=1.7.0",
     "tqdm>=4.60.0",
     "requests>=2.25.0",
     "matplotlib>=3.3.0",
     "seaborn>=0.11.0",
-    "dash>=3.2.0",
 ]
 dynamic = ["version"]
 
@@ -69,6 +67,7 @@ transformers = [
     "datasets>=2.0.0",
 ]
 advanced = [
+    "dash>=3.2.0",
     "plotly>=5.0.0",
     "ipywidgets>=7.6.0",
     "jupyter>=1.0.0",

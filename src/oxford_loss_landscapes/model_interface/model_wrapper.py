@@ -13,8 +13,25 @@ class ModelWrapper(abc.ABC):
     def get_modules(self) -> list:
         return self.modules
 
-    def get_module_parameters(self) -> ModelParameters:
-        return ModelParameters([p for module in self.modules for p in module.parameters()])
+    def get_module_parameters(self, trainable_only: bool = False) -> ModelParameters:
+        params = [
+            p
+            for module in self.modules
+            for p in module.parameters()
+            if p.is_floating_point() and (not trainable_only or p.requires_grad)
+        ]
+        return ModelParameters(params)
+
+    def snapshot_parameters(self) -> list:
+        """Clone current floating-point parameters for safe in-place restoration."""
+        return [p.detach().clone() for p in self.get_module_parameters()]
+
+    def restore_parameters(self, snapshot: list) -> None:
+        """Restore parameters from a snapshot created by :meth:`snapshot_parameters`."""
+        params = self.get_module_parameters()
+        with torch.no_grad():
+            for param, saved in zip(params, snapshot):
+                param.copy_(saved)
 
     def train(self, mode=True) -> 'ModelWrapper':
         for module in self.modules:
@@ -68,8 +85,8 @@ class TransformerModelWrapper(ModelWrapper):
             encoded = self.tokenizer(inputs, return_tensors="pt")
             return self.model(**encoded)
 
-    def get_module_parameters(self):
-        return ModelParameters(list(self.model.parameters()))
+    def get_module_parameters(self, trainable_only: bool = False) -> ModelParameters:
+        return super().get_module_parameters(trainable_only=trainable_only)
 
 
 class SimpleModelWrapper(ModelWrapper):
