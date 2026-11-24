@@ -459,6 +459,8 @@ def hessian_plane(
     from .hessian.vrpca.utils import collect_parameters, unflatten_like
 
     if isinstance(model, ModelWrapper):
+        if len(model.modules) != 1:
+            raise ValueError("hessian_plane with VR-PCA requires exactly one module.")
         raw_module = model.modules[0]
     else:
         raw_module = model

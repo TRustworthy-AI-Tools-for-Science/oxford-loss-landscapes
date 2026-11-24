@@ -30,6 +30,20 @@ def test_export_plane_writes_coordinate_bounds(tmp_path, monkeypatch):
     assert "coordinate_max = 0.25" in config
 
 
+def test_hessian_plane_rejects_multi_module_wrapper():
+    from oxford_loss_landscapes.main import hessian_plane
+    from oxford_loss_landscapes.model_interface.model_wrapper import GeneralModelWrapper
+
+    wrapper = GeneralModelWrapper(
+        model=None,
+        modules=[nn.Linear(2, 2), nn.Linear(2, 1)],
+        forward_fn=lambda model, inputs: inputs,
+    )
+
+    with pytest.raises(ValueError, match="exactly one module"):
+        hessian_plane(wrapper, metric=None)
+
+
 def test_random_plane():
     """Test the random_plane function."""
     try:
