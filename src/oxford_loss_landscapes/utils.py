@@ -1,5 +1,5 @@
 import numpy as np
-import scipy
+import scipy.spatial
 
 def estimate_surf_vol(x_range: tuple, y_range: tuple, z_array: np.array):
     """
@@ -59,5 +59,7 @@ def trapezoidal_area(x_range: tuple, y_range: tuple, z_array: np.array):
 
     a = tri[:,0,:2] - tri[:,1,:2]
     b = tri[:,0,:2] - tri[:,2,:2]
-    vol = np.cross(a, b) @ tri[:,:,2]
+    # 2-D cross product (z-component); np.cross no longer supports 2-D vectors in NumPy>=2.5
+    cross = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+    vol = cross @ tri[:,:,2]
     return vol.sum() / 6.0
