@@ -159,7 +159,7 @@ class HessianVectorProductOracle:
         )
 
         # Keep only parameters participating in the graph for second differentiation
-        active_indices = [idx for idx, g in enumerate(raw_grads) if g is not None]
+        active_indices = [idx for idx, g in enumerate(raw_grads) if g is not None and g.requires_grad]
         if not active_indices:
             return [torch.zeros_like(param) for param in self.params]
 
