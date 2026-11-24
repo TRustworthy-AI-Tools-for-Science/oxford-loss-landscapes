@@ -492,6 +492,10 @@ def hessian_plane(
         ]
         half_one = ModelParameters(full_eigvec)
         half_two = orthogonal_to(half_one)
+        with torch.no_grad():
+            for orig_p, direction_p in zip(orig_params, half_two):
+                if not orig_p.requires_grad:
+                    direction_p.zero_()
 
         target_norm = start_point.model_norm(2) * float(distance)
         _scale_direction(half_one, target_norm)
