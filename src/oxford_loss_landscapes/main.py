@@ -2,13 +2,13 @@
 Functions for approximating loss/return landscapes in one and two dimensions.
 """
 import copy
+import datetime
 import multiprocessing
 import os
 import traceback
-import datetime
 import typing
-import torch.nn
 import numpy as np
+import torch.nn
 from tqdm import trange
 
 try:
@@ -23,39 +23,129 @@ from .metrics.metric import Metric
 USE_PARALLEL = False
 
 
-def _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_wrapper, distance=1.0, export=False):
+def _scale_direction(direction: ModelParameters, target_norm: float) -> ModelParameters:
+    """Scale ``direction`` in-place to have L2 norm ``target_norm`` (no-op if zero)."""
+    dir_norm = direction.model_norm(2)
+    if dir_norm > 1e-12:
+        direction.mul_(target_norm / dir_norm)
+    return direction
+
+
+def _normalize_direction(
+    direction: ModelParameters,
+    ref_point: ModelParameters,
+    normalization: typing.Optional[str],
+) -> ModelParameters:
+    """Apply requested parameter-space normalization in-place."""
+    if normalization == 'model':
+        direction.model_normalize_(ref_point)
+    elif normalization == 'layer':
+        direction.layer_normalize_(ref_point)
+    elif normalization == 'filter':
+        direction.filter_normalize_(ref_point)
+    elif normalization is None:
+        pass
+    else:
+        raise AttributeError(
+            'Unsupported normalization argument. Supported values are model, layer, and filter'
+        )
+    return direction
+
+
+def _set_params_offset(
+    target_params: ModelParameters,
+    base_tensors: typing.Sequence[torch.Tensor],
+    alpha: float = 0.0,
+    dir_one: typing.Optional[ModelParameters] = None,
+    beta: float = 0.0,
+    dir_two: typing.Optional[ModelParameters] = None,
+) -> None:
+    """Set ``target_params`` in-place to ``base + alpha * dir_one + beta * dir_two``.
+
+    Computing every grid point directly from the immutable baseline snapshot
+    eliminates cumulative floating-point drift across steps and guarantees that
+    ``(alpha=0, beta=0)`` evaluates at the exact bit-for-bit original weights.
     """
-    Helper function to evaluate a planar region in parameter space.
-    This avoids code duplication between planar_interpolation and random_plane.
-    Exports binary landscape output and config toml to results folder if export is True, else outputs numpy array.
+    with torch.no_grad():
+        for idx, base in enumerate(base_tensors):
+            if (dir_one is None or alpha == 0.0) and (dir_two is None or beta == 0.0):
+                target_params.parameters[idx].copy_(base)
+                continue
+            val = base.clone()
+            if dir_one is not None and alpha != 0.0:
+                val.add_(dir_one[idx], alpha=float(alpha))
+            if dir_two is not None and beta != 0.0:
+                val.add_(dir_two[idx], alpha=float(beta))
+            target_params.parameters[idx].copy_(val)
+
+
+def _centered_grid_coords(steps: int) -> np.ndarray:
+    """Return symmetric 1D grid coordinates in ``[-1, +1]`` centered at ``0``.
+
+    - For odd ``steps``, ``coords[steps // 2] == 0.0`` exactly.
+    - For even ``steps``, ``coords`` is strictly symmetric around ``0.0``.
+    - For ``steps <= 1``, returns ``np.array([0.0])``.
     """
+    steps_int = int(steps)
+    if steps_int <= 1:
+        return np.array([0.0], dtype=float)
+    coords = np.linspace(-1.0, 1.0, steps_int, dtype=float)
+    if steps_int % 2 == 1:
+        coords[steps_int // 2] = 0.0
+    return coords
+
+
+def _evaluate_plane(
+    start_point,
+    dir_one,
+    dir_two,
+    steps,
+    metric,
+    model_wrapper,
+    distance=1.0,
+    export=False,
+    *,
+    centered: bool = False,
+):
+    """Evaluate a 2D planar region in parameter space with zero cumulative drift.
+
+    When ``centered=True``, ``start_point`` is the unperturbed center ``theta_0``
+    and ``dir_one``/``dir_two`` are half-span vectors; grid coordinates span
+    ``[-1, +1] x [-1, +1]`` so ``(steps // 2, steps // 2)`` evaluates at exact
+    ``theta_0`` for odd ``steps`` and the grid is strictly symmetric around
+    ``theta_0`` for even ``steps``.
+
+    When ``centered=False`` (legacy direct-call mode), ``start_point`` is the
+    grid corner and ``dir_one``/``dir_two`` are per-step increments evaluated at
+    ``start_point + i * dir_one + j * dir_two`` for ``i, j in range(steps)``.
+    """
+    steps_int = int(steps)
+    target_params = model_wrapper.get_module_parameters()
+    base_tensors = [p.detach().clone() for p in start_point]
+    coords = _centered_grid_coords(steps_int) if centered else np.arange(steps_int, dtype=float)
+
     data_matrix = []
-    # evaluate loss in grid of (steps * steps) points, where each column signifies one step
-    # along dir_one and each row signifies one step along dir_two. The implementation is again
-    # a little convoluted to avoid constructive operations. Fundamentally we generate the matrix
-    # [[start_point + (dir_one * i) + (dir_two * j) for j in range(steps)] for i in range(steps].
-
-    for i in trange(steps, desc='Calculating Surface...'):
+    for alpha in trange(steps_int, desc='Calculating Surface...'):
+        a_val = float(coords[alpha])
         data_column = []
-
-        for _ in range(steps):
-            # Snake traversal: even columns go forward along dir_two, odd go backward.
-            # Evaluate BEFORE moving on even columns so both column types sample the same
-            # row offsets {0, 1, ..., steps-1} and the grid center aligns with the model.
-            if i % 2 == 0:
-                data_column.append(metric(model_wrapper))
-                start_point.add_(dir_two)
-            else:
-                start_point.sub_(dir_two)
-                data_column.insert(0, metric(model_wrapper))
-
+        for beta in range(steps_int):
+            b_val = float(coords[beta])
+            _set_params_offset(
+                target_params,
+                base_tensors,
+                alpha=a_val,
+                dir_one=dir_one,
+                beta=b_val,
+                dir_two=dir_two,
+            )
+            data_column.append(metric(model_wrapper))
         data_matrix.append(data_column)
-        start_point.add_(dir_one)
 
     if export:
         _export_plane_to_npy(data_matrix, distance)
     else:
         return np.array(data_matrix)
+
 
 def _export_plane_to_npy(data_matrix, distance):
     """
@@ -69,6 +159,8 @@ def _export_plane_to_npy(data_matrix, distance):
     toml_filename = f"{filename}.toml"
     with open(os.path.join(results_dir, toml_filename), "w", encoding="utf-8") as f:
         f.write(f'distance = {float(distance)}\n')
+        f.write(f'coordinate_min = {-float(distance)}\n')
+        f.write(f'coordinate_max = {float(distance)}\n')
 
     data_filename = f"{filename}.npy"
     data_file_path = os.path.join(results_dir, data_filename)
@@ -78,28 +170,37 @@ def _export_plane_to_npy(data_matrix, distance):
 
 
 def _evaluate_plane_parallel(
-    start_point, dir_one, dir_two, steps, metric, model_wrapper,
-    distance=1.0, export=False, num_workers=None,
+    start_point,
+    dir_one,
+    dir_two,
+    steps,
+    metric,
+    model_wrapper,
+    distance=1.0,
+    export=False,
+    num_workers=None,
+    *,
+    centered: bool = False,
 ):
     """Parallel version of _evaluate_plane using Ray remote workers.
 
-    Each row of the evaluation grid is dispatched to an independent Ray worker.
-    Falls back to sequential evaluation if Ray is unavailable or fails.
+    Each row of the evaluation grid is dispatched to an independent Ray worker
+    and computed directly from the baseline tensors (zero cumulative drift,
+    exact match with ``_evaluate_plane``). Falls back to sequential evaluation
+    if Ray is unavailable or fails.
     """
     def _sequential_eval(sp, d1, d2, steps_, metric_, wrapper_):
-        data_matrix = []
-        for i in range(int(steps_)):
-            data_column = []
-            for _ in range(int(steps_)):
-                if i % 2 == 0:
-                    sp.add_(d2)
-                    data_column.append(metric_(wrapper_))
-                else:
-                    sp.sub_(d2)
-                    data_column.insert(0, metric_(wrapper_))
-            data_matrix.append(data_column)
-            sp.add_(d1)
-        return np.array(data_matrix)
+        return _evaluate_plane(
+            sp,
+            d1,
+            d2,
+            int(steps_),
+            metric_,
+            wrapper_,
+            distance=distance,
+            export=export,
+            centered=centered,
+        )
 
     if ray is None or not ray.is_initialized():
         try:
@@ -116,44 +217,46 @@ def _evaluate_plane_parallel(
     except Exception:
         available_cpus = multiprocessing.cpu_count()
 
+    steps_int = int(steps)
     if num_workers is None:
-        num_workers = min(steps, max(1, available_cpus))
+        num_workers = min(steps_int, max(1, available_cpus))
 
     @ray.remote
-    def eval_row(row_start_params, dir_two_params, steps_, metric_fn, wrapper_, row_idx):
+    def eval_row(base_params, dir_one_params, dir_two_params, alpha_val, beta_coords, metric_fn, wrapper_):
         local_wrapper = copy.deepcopy(wrapper_)
         local_params = local_wrapper.get_module_parameters()
-        for idx in range(len(local_params)):
-            local_params.parameters[idx].data = row_start_params[idx].clone()
         data_column = []
-        for _ in range(int(steps_)):
-            if row_idx % 2 == 0:
-                for idx in range(len(local_params)):
-                    local_params.parameters[idx].data = (
-                        local_params.parameters[idx].data + dir_two_params[idx]
-                    )
-            else:
-                for idx in range(len(local_params)):
-                    local_params.parameters[idx].data = (
-                        local_params.parameters[idx].data - dir_two_params[idx]
-                    )
-            val = metric_fn(local_wrapper)
-            if row_idx % 2 == 0:
-                data_column.append(val)
-            else:
-                data_column.insert(0, val)
+        for b_val in beta_coords:
+            with torch.no_grad():
+                for idx, base in enumerate(base_params):
+                    if alpha_val == 0.0 and b_val == 0.0:
+                        local_params.parameters[idx].copy_(base)
+                    else:
+                        val = base.clone()
+                        if alpha_val != 0.0:
+                            val.add_(dir_one_params[idx], alpha=float(alpha_val))
+                        if b_val != 0.0:
+                            val.add_(dir_two_params[idx], alpha=float(b_val))
+                        local_params.parameters[idx].copy_(val)
+            data_column.append(metric_fn(local_wrapper))
         return data_column
 
-    row_params = []
-    current = start_point
-    dir_two_data = [p.data.clone().detach() for p in dir_two]
-    for i in range(int(steps)):
-        row_params.append([p.data.clone().detach() for p in current])
-        current = current + dir_one
+    coords = _centered_grid_coords(steps_int) if centered else np.arange(steps_int, dtype=float)
+    base_data = [p.detach().clone() for p in start_point]
+    dir_one_data = [p.detach().clone() for p in dir_one]
+    dir_two_data = [p.detach().clone() for p in dir_two]
 
     tasks = [
-        eval_row.remote(row_params[i], dir_two_data, steps, metric, model_wrapper, i)
-        for i in range(int(steps))
+        eval_row.remote(
+            base_data,
+            dir_one_data,
+            dir_two_data,
+            float(coords[i]),
+            coords.tolist(),
+            metric,
+            model_wrapper,
+        )
+        for i in range(steps_int)
     ]
 
     try:
@@ -174,254 +277,190 @@ def point(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric) ->
     """
     Returns the computed value of the evaluation function applied to the model
     or agent at a specific point in parameter space.
-
-    The Metric supplied has to be a subclass of the loss_landscapes.metrics.Metric
-    class, and must specify a procedure whereby the model passed to it is evaluated on the
-    task of interest, returning the resulting quantity (such as loss, loss gradient, etc).
-
-    The model supplied can be either a torch.nn.Module model, or a ModelWrapper from the
-    loss_landscapes library for more complex cases.
-
-    :param model: the model or model wrapper defining the point in parameter space
-    :param metric: Metric object used to evaluate model
-    :return: quantity specified by Metric at point in parameter space
     """
     return metric(wrap_model(model))
 
 
-def linear_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper],
-                         model_end: typing.Union[torch.nn.Module, ModelWrapper],
-                         metric: Metric, steps=100, deepcopy_model=False, distance=1.0) -> np.ndarray:
+def linear_interpolation(
+    model_start: typing.Union[torch.nn.Module, ModelWrapper],
+    model_end: typing.Union[torch.nn.Module, ModelWrapper],
+    metric: Metric,
+    steps=100,
+    deepcopy_model=False,
+    distance=1.0,
+    restore_model: bool = True,
+) -> np.ndarray:
     """
-    Returns the computed value of the evaluation function applied to the model or
-    agent along a linear subspace of the parameter space defined by two end points.
-    The models supplied can be either torch.nn.Module models, or ModelWrapper objects
-    from the loss_landscapes library for more complex cases.
-
-    That is, given two models, for both of which the model's parameters define a
-    vertex in parameter space, the evaluation is computed at the given number of steps
-    along the straight line connecting the two vertices. A common choice is to
-    use the weights before training and the weights after convergence as the start
-    and end points of the line, thus obtaining a view of the "straight line" in
-    parameter space from the initialization to some minima. There is no guarantee
-    that the model followed this path during optimization. In fact, it is highly
-    unlikely to have done so, unless the optimization problem is convex.
-
-    Note that a simple linear interpolation can produce misleading approximations
-    of the loss landscape due to the scale invariance of neural networks. The sharpness/
-    flatness of minima or maxima is affected by the scale of the neural network weights.
-    For more details, see `https://arxiv.org/abs/1712.09913v3`. It is recommended to
-    use random_line() with filter normalization instead.
-
-    The Metric supplied has to be a subclass of the loss_landscapes.metrics.Metric class,
-    and must specify a procedure whereby the model passed to it is evaluated on the
-    task of interest, returning the resulting quantity (such as loss, loss gradient, etc).
-
-    :param model_start: the model defining the start point of the line in parameter space
-    :param model_end: the model defining the end point of the line in parameter space
-    :param metric: list of function of form evaluation_f(model), used to evaluate model loss
-    :param steps: at how many steps from start to end the model is evaluated
-    :param deepcopy_model: indicates whether the method will deepcopy the model(s) to avoid aliasing
-    :return: 1-d array of loss values along the line connecting start and end models
+    Evaluate ``metric`` at ``steps`` evenly spaced points along the line
+    connecting ``model_start`` to ``model_start + distance * (model_end - model_start)``.
     """
-    # create wrappers from deep copies to avoid aliasing if desired
     model_start_wrapper = wrap_model(copy.deepcopy(model_start) if deepcopy_model else model_start)
     end_model_wrapper = wrap_model(copy.deepcopy(model_end) if deepcopy_model else model_end)
 
-    start_point = model_start_wrapper.get_module_parameters()
-    end_point = end_model_wrapper.get_module_parameters()
-    direction = (end_point - start_point) / steps
+    snapshot = model_start_wrapper.snapshot_parameters() if (not deepcopy_model and restore_model) else None
+    try:
+        start_point = model_start_wrapper.get_module_parameters()
+        end_point = end_model_wrapper.get_module_parameters()
+        base_tensors = [p.detach().clone() for p in start_point]
+        delta = end_point - start_point
 
-    data_values = []
-    for _ in trange(steps, desc='Calculating...'):
-        # add a step along the line to the model parameters, then evaluate
-        start_point.add_(direction)
-        data_values.append(metric(model_start_wrapper))
+        steps_int = int(steps)
+        ts = np.array([0.0], dtype=float) if steps_int <= 1 else np.linspace(0.0, float(distance), steps_int)
+
+        data_values = []
+        for idx in trange(steps_int, desc='Calculating...'):
+            _set_params_offset(start_point, base_tensors, alpha=float(ts[idx]), dir_one=delta)
+            data_values.append(metric(model_start_wrapper))
+    finally:
+        if snapshot is not None:
+            model_start_wrapper.restore_parameters(snapshot)
 
     return np.array(data_values)
 
 
-def random_line(model_start: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric, distance=0.1, steps=100,
-                normalization='filter', deepcopy_model=False) -> np.ndarray:
+def random_line(
+    model_start: typing.Union[torch.nn.Module, ModelWrapper],
+    metric: Metric,
+    distance=0.1,
+    steps=100,
+    normalization='filter',
+    deepcopy_model=False,
+    restore_model: bool = True,
+) -> np.ndarray:
     """
-    Returns the computed value of the evaluation function applied to the model or agent along a
-    linear subspace of the parameter space defined by a start point and a randomly sampled direction.
-    The models supplied can be either torch.nn.Module models, or ModelWrapper objects
-    from the loss_landscapes library for more complex cases.
+    Evaluate ``metric`` along a symmetric 1D random direction spanning
+    ``[-distance, +distance]`` centered at ``model_start``.
 
-    That is, given a neural network model, whose parameters define a point in parameter
-    space, and a distance, the evaluation is computed at 'steps' points along a random
-    direction, from the start point up to the maximum distance from the start point.
-
-    Note that the dimensionality of the model parameters has an impact on the expected
-    length of a uniformly sampled other in parameter space. That is, the more parameters
-    a model has, the longer the distance in the random other's direction should be,
-    in order to see meaningful change in individual parameters. Normalizing the
-    direction other according to the model's current parameter values, which is supported
-    through the 'normalization' parameter, helps reduce the impact of the distance
-    parameter. In future releases, the distance parameter will refer to the maximum change
-    in an individual parameter, rather than the length of the random direction other.
-
-    Note also that a simple line approximation can produce misleading views
-    of the loss landscape due to the scale invariance of neural networks. The sharpness or
-    flatness of minima or maxima is affected by the scale of the neural network weights.
-    For more details, see `https://arxiv.org/abs/1712.09913v3`. It is recommended to
-    normalize the direction, preferably with the 'filter' option.
-
-    The Metric supplied has to be a subclass of the loss_landscapes.metrics.Metric class,
-    and must specify a procedure whereby the model passed to it is evaluated on the
-    task of interest, returning the resulting quantity (such as loss, loss gradient, etc).
-
-    :param model_start: model to be evaluated, whose current parameters represent the start point
-    :param metric: function of form evaluation_f(model), used to evaluate model loss
-    :param distance: maximum distance in parameter space from the start point
-    :param steps: at how many steps from start to end the model is evaluated
-    :param normalization: normalization of direction other, must be one of 'filter', 'layer', 'model'
-    :param deepcopy_model: indicates whether the method will deepcopy the model(s) to avoid aliasing
-    :return: 1-d array of loss values along the randomly sampled direction
+    For odd ``steps``, ``result[steps // 2]`` evaluates at the exact bit-for-bit
+    unperturbed parameters of ``model_start``. For even ``steps``, grid points
+    are strictly symmetric around ``model_start``. When ``deepcopy_model=False``
+    and ``restore_model=True`` (default), original parameters are restored in a
+    ``finally`` block, making this safe for non-deepcopyable modules such as
+    ``e3nn`` / TorchScript MLFFs and ASE calculators.
     """
-    # create wrappers from deep copies to avoid aliasing if desired
     model_start_wrapper = wrap_model(copy.deepcopy(model_start) if deepcopy_model else model_start)
+    snapshot = model_start_wrapper.snapshot_parameters() if (not deepcopy_model and restore_model) else None
 
-    # obtain start point in parameter space and random direction
-    # random direction is randomly sampled, then normalized, and finally scaled by distance/steps
-    start_point = model_start_wrapper.get_module_parameters()
-    direction = rand_n_like(start_point)
+    try:
+        start_point = model_start_wrapper.get_module_parameters()
+        base_tensors = [p.detach().clone() for p in start_point]
+        direction = rand_n_like(start_point)
+        _normalize_direction(direction, start_point, normalization)
 
-    if normalization == 'model':
-        direction.model_normalize_(start_point)
-    elif normalization == 'layer':
-        direction.layer_normalize_(start_point)
-    elif normalization == 'filter':
-        direction.filter_normalize_(start_point)
-    elif normalization is None:
-        pass
-    else:
-        raise AttributeError('Unsupported normalization argument. Supported values are model, layer, and filter')
+        # Scale full half-span to start_point.model_norm() * distance
+        _scale_direction(direction, start_point.model_norm(2) * float(distance))
 
-    # direction.mul_(((start_point.model_norm() * distance) / steps) / direction.model_norm())
-    start_point.sub_(direction)
-    direction.truediv_(steps / 2)
+        steps_int = int(steps)
+        coords = _centered_grid_coords(steps_int)
 
-    data_values = []
-    for _ in trange(steps, desc='Calculating...'):
-        # add a step along the line to the model parameters, then evaluate
-        start_point.add_(direction)
-        data_values.append(metric(model_start_wrapper))
+        data_values = []
+        for idx in trange(steps_int, desc='Calculating...'):
+            _set_params_offset(start_point, base_tensors, alpha=float(coords[idx]), dir_one=direction)
+            data_values.append(metric(model_start_wrapper))
+    finally:
+        if snapshot is not None:
+            model_start_wrapper.restore_parameters(snapshot)
 
     return np.array(data_values)
 
 
-def planar_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper],
-                         model_end_one: typing.Union[torch.nn.Module, ModelWrapper],
-                         model_end_two: typing.Union[torch.nn.Module, ModelWrapper],
-                         metric: Metric, distance=1.0, steps=20, deepcopy_model=False,
-                         eigen_models=False, use_ray=False, num_workers=None) -> np.ndarray:
+def planar_interpolation(
+    model_start: typing.Union[torch.nn.Module, ModelWrapper],
+    model_end_one: typing.Union[torch.nn.Module, ModelWrapper],
+    model_end_two: typing.Union[torch.nn.Module, ModelWrapper],
+    metric: Metric,
+    distance=1.0,
+    steps=20,
+    deepcopy_model=False,
+    eigen_models=False,
+    use_ray=False,
+    num_workers=None,
+    restore_model: bool = True,
+) -> np.ndarray:
     """
-    Returns the computed value of the evaluation function applied to the model or agent along
-    a planar subspace of the parameter space defined by a start point and two end points.
-    The models supplied can be either torch.nn.Module models, or ModelWrapper objects
-    from the loss_landscapes library for more complex cases.
+    Evaluate ``metric`` over a 2D planar subspace centered at ``model_start``
+    and spanned by ``model_end_one`` and ``model_end_two``.
 
-    That is, given two models, for both of which the model's parameters define a
-    vertex in parameter space, the loss is computed at the given number of steps
-    along the straight line connecting the two vertices. A common choice is to
-    use the weights before training and the weights after convergence as the start
-    and end points of the line, thus obtaining a view of the "straight line" in
-    paramater space from the initialization to some minima. There is no guarantee
-    that the model followed this path during optimization. In fact, it is highly
-    unlikely to have done so, unless the optimization problem is convex.
-
-    That is, given three neural network models, 'model_start', 'model_end_one', and
-    'model_end_two', each of which defines a point in parameter space, the loss is
-    computed at 'steps' * 'steps' points along the plane defined by the start vertex
-    and the two vectors (end_one - start) and (end_two - start), up to the maximum
-    distance in both directions. A common choice would be for two of the points to be
-    the model after initialization, and the model after convergence. The third point
-    could be another randomly initialized model, since in a high-dimensional space
-    randomly sampled directions are most likely to be orthogonal.
-
-    The Metric supplied has to be a subclass of the loss_landscapes.metrics.Metric class,
-    and must specify a procedure whereby the model passed to it is evaluated on the
-    task of interest, returning the resulting quantity (such as loss, loss gradient, etc).
-
-    :param model_start: the model defining the origin point of the plane in parameter space
-    :param model_end_one: the model representing the end point of the first direction defining the plane
-    :param model_end_two: the model representing the end point of the second direction defining the plane
-    :param metric: function of form evaluation_f(model), used to evaluate model loss
-    :param steps: at how many steps from start to end the model is evaluated
-    :param deepcopy_model: indicates whether the method will deepcopy the model(s) to avoid aliasing
-    :return: 1-d array of loss values along the line connecting start and end models
+    For odd ``steps``, ``result[steps // 2, steps // 2]`` evaluates at the exact
+    unperturbed parameters of ``model_start``.
     """
     model_start_wrapper = wrap_model(copy.deepcopy(model_start) if deepcopy_model else model_start)
     model_end_one_wrapper = wrap_model(copy.deepcopy(model_end_one) if deepcopy_model else model_end_one)
     model_end_two_wrapper = wrap_model(copy.deepcopy(model_end_two) if deepcopy_model else model_end_two)
 
-    # compute direction vectors
-    start_point = model_start_wrapper.get_module_parameters()
+    snapshot = model_start_wrapper.snapshot_parameters() if (not deepcopy_model and restore_model) else None
+    try:
+        start_point = model_start_wrapper.get_module_parameters()
+        steps_int = int(steps)
 
-    if eigen_models:
-        dir_one = distance*(model_end_one_wrapper.get_module_parameters()) / steps
-        dir_two = distance*(model_end_two_wrapper.get_module_parameters()) / steps
-    else:
-        dir_one = distance*(model_end_one_wrapper.get_module_parameters() - start_point) / steps
-        dir_two = distance*(model_end_two_wrapper.get_module_parameters() - start_point) / steps
-    
-    # scale to match steps and total distance
-    # dir_one.mul_(((start_point.model_norm() * distance) / steps) / dir_one.model_norm())
-    # dir_two.mul_(((start_point.model_norm() * distance) / steps) / dir_two.model_norm())
-    # Move start point so that original start params will be in the center of the plot
-    dir_one.mul_(steps / 2)
-    dir_two.mul_(steps / 2)
-    start_point.sub_(dir_one)
-    start_point.sub_(dir_two)
-    dir_one.truediv_(steps / 2)
-    dir_two.truediv_(steps / 2)
+        if eigen_models:
+            half_one = model_end_one_wrapper.get_module_parameters() * float(distance)
+            half_two = model_end_two_wrapper.get_module_parameters() * float(distance)
+        else:
+            half_one = (model_end_one_wrapper.get_module_parameters() - start_point) * float(distance)
+            half_two = (model_end_two_wrapper.get_module_parameters() - start_point) * float(distance)
 
-    if use_ray or USE_PARALLEL:
-        return _evaluate_plane_parallel(start_point, dir_one, dir_two, steps, metric, model_start_wrapper, num_workers=num_workers)
-    return _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_start_wrapper)
+        if use_ray or USE_PARALLEL:
+            return _evaluate_plane_parallel(
+                start_point,
+                half_one,
+                half_two,
+                steps_int,
+                metric,
+                model_start_wrapper,
+                distance=distance,
+                num_workers=num_workers,
+                centered=True,
+            )
+        return _evaluate_plane(
+            start_point,
+            half_one,
+            half_two,
+            steps_int,
+            metric,
+            model_start_wrapper,
+            distance=distance,
+            centered=True,
+        )
+    finally:
+        if snapshot is not None:
+            model_start_wrapper.restore_parameters(snapshot)
 
 
 def hessian_plane(
     model: typing.Union[torch.nn.Module, ModelWrapper],
     metric: Metric,
-    criterion,
-    inputs,
-    targets,
+    criterion=None,
+    inputs=None,
+    targets=None,
     *,
     distance: float = 1.0,
     steps: int = 20,
     deepcopy_model: bool = False,
     vrpca_config=None,
     export: bool = False,
+    restore_model: bool = True,
+    forward_fn=None,
+    loss_callable=None,
+    dataset_size: typing.Optional[int] = None,
 ) -> np.ndarray:
     """
-    Returns the computed value of the evaluation function along a planar subspace
-    spanned by the dominant Hessian eigenvector (computed via VR-PCA) and a random
-    orthogonal direction.
+    Evaluate ``metric`` along a planar subspace centered at ``model`` and
+    spanned by the dominant parameter-Hessian eigenvector (computed via VR-PCA)
+    and a random orthogonal direction.
 
-    This is the recommended way to visualize loss landscapes around a trained model,
-    since the Hessian eigenvector points in the direction of greatest curvature.
-
-    :param model: model whose current parameters define the centre of the plane
-    :param metric: Metric object used to evaluate the model
-    :param criterion: loss function used to compute the Hessian (e.g. nn.CrossEntropyLoss())
-    :param inputs: input tensor(s) passed to the model for Hessian computation
-    :param targets: target tensor(s) for the loss function
-    :param distance: maximum distance from the centre in each direction
-    :param steps: grid resolution (steps x steps evaluations)
-    :param deepcopy_model: if True, deepcopy the model before perturbing
-    :param vrpca_config: VRPCAConfig instance; uses sensible defaults if None
-    :param export: if True, write the result to a .npy file instead of returning it
-    :return: (steps x steps) numpy array of metric values, or None if export=True
+    For odd ``steps``, ``result[steps // 2, steps // 2]`` evaluates at the exact
+    bit-for-bit unperturbed parameters of ``model``. Supports both standard
+    tensor batches and graph/dict MLFF inputs via ``forward_fn`` or
+    ``loss_callable``, and safely pads frozen (``requires_grad=False``)
+    parameters with zeros.
     """
     from .hessian.vrpca import top_hessian_eigenpair_vrpca, VRPCAConfig
-    from .hessian.vrpca.utils import unflatten_like
+    from .hessian.vrpca.utils import collect_parameters, unflatten_like
 
-    # Extract raw nn.Module BEFORE wrap_model, because wrap_model disables requires_grad
-    # and VR-PCA needs differentiable parameters.
     if isinstance(model, ModelWrapper):
+        if len(model.modules) != 1:
+            raise ValueError("hessian_plane with VR-PCA requires exactly one module.")
         raw_module = model.modules[0]
     else:
         raw_module = model
@@ -433,107 +472,116 @@ def hessian_plane(
         targets=targets,
         criterion=criterion,
         config=cfg,
+        forward_fn=forward_fn,
+        loss_callable=loss_callable,
+        dataset_size=dataset_size,
     )
 
+    # Map differentiable eigenvector back onto full parameter list (pad frozen params with 0)
+    diff_params = collect_parameters(raw_module, all_params=True)
+    eigvec_diff = unflatten_like(result.eigenvector.detach(), diff_params)
+    diff_map = {id(p): v for p, v in zip(diff_params, eigvec_diff)}
+
     model_wrapper = wrap_model(copy.deepcopy(model) if deepcopy_model else model)
-    start_point = model_wrapper.get_module_parameters()
-    params_ref = start_point._get_parameters()
+    snapshot = model_wrapper.snapshot_parameters() if (not deepcopy_model and restore_model) else None
 
-    # Reshape the flat eigenvector into per-parameter tensors
-    eigvec_list = unflatten_like(result.eigenvector.detach(), params_ref)
-    dir_one = ModelParameters(eigvec_list)
+    try:
+        start_point = model_wrapper.get_module_parameters()
+        orig_params = wrap_model(model).get_module_parameters() if deepcopy_model else start_point
+        full_eigvec = [
+            diff_map[id(orig_p)].clone().to(device=cur_p.device, dtype=cur_p.dtype)
+            if id(orig_p) in diff_map
+            else torch.zeros_like(cur_p)
+            for orig_p, cur_p in zip(orig_params, start_point)
+        ]
+        half_one = ModelParameters(full_eigvec)
+        half_two = orthogonal_to(half_one)
+        with torch.no_grad():
+            for orig_p, direction_p in zip(orig_params, half_two):
+                if not orig_p.requires_grad:
+                    direction_p.zero_()
 
-    # Second direction: random vector orthogonal to the eigenvector
-    dir_two = orthogonal_to(dir_one)
+        target_norm = start_point.model_norm(2) * float(distance)
+        _scale_direction(half_one, target_norm)
+        _scale_direction(half_two, target_norm)
 
-    # Scale both directions to cover `distance` over the full grid
-    dir_one.mul_(((start_point.model_norm() * distance) / steps) / dir_one.model_norm())
-    dir_two.mul_(((start_point.model_norm() * distance) / steps) / dir_two.model_norm())
+        return _evaluate_plane(
+            start_point,
+            half_one,
+            half_two,
+            int(steps),
+            metric,
+            model_wrapper,
+            distance=distance,
+            export=export,
+            centered=True,
+        )
+    finally:
+        if snapshot is not None:
+            model_wrapper.restore_parameters(snapshot)
 
-    # Shift start to the corner so the original params sit at the grid centre
-    dir_one.mul_(steps / 2)
-    dir_two.mul_(steps / 2)
-    start_point.sub_(dir_one)
-    start_point.sub_(dir_two)
-    dir_one.truediv_(steps / 2)
-    dir_two.truediv_(steps / 2)
 
-    return _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_wrapper, distance, export)
-
-
-def random_plane(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric, distance=1, steps=20,
-                 normalization='filter', deepcopy_model=False, export=False,
-                 use_ray=False, num_workers=None) -> np.ndarray:
+def random_plane(
+    model: typing.Union[torch.nn.Module, ModelWrapper],
+    metric: Metric,
+    distance=1,
+    steps=20,
+    normalization='filter',
+    deepcopy_model=False,
+    export=False,
+    use_ray=False,
+    num_workers=None,
+    restore_model: bool = True,
+) -> np.ndarray:
     """
-    Returns the computed value of the evaluation function applied to the model or agent along a planar
-    subspace of the parameter space defined by a start point and two randomly sampled directions.
-    The models supplied can be either torch.nn.Module models, or ModelWrapper objects
-    from the loss_landscapes library for more complex cases.
+    Evaluate ``metric`` over a symmetric 2D random plane spanning
+    ``[-distance, +distance]^2`` centered at ``model``.
 
-    That is, given a neural network model, whose parameters define a point in parameter
-    space, and a distance, the loss is computed at 'steps' * 'steps' points along the
-    plane defined by the two random directions, from the start point up to the maximum
-    distance in both directions.
-
-    Note that the dimensionality of the model parameters has an impact on the expected
-    length of a uniformly sampled other in parameter space. That is, the more parameters
-    a model has, the longer the distance in the random other's direction should be,
-    in order to see meaningful change in individual parameters. Normalizing the
-    direction other according to the model's current parameter values, which is supported
-    through the 'normalization' parameter, helps reduce the impact of the distance
-    parameter. In future releases, the distance parameter will refer to the maximum change
-    in an individual parameter, rather than the length of the random direction other.
-
-    Note also that a simple planar approximation with randomly sampled directions can produce
-    misleading approximations of the loss landscape due to the scale invariance of neural
-    networks. The sharpness/flatness of minima or maxima is affected by the scale of the neural
-    network weights. For more details, see `https://arxiv.org/abs/1712.09913v3`. It is
-    recommended to normalize the directions, preferably with the 'filter' option.
-
-    The Metric supplied has to be a subclass of the loss_landscapes.metrics.Metric class,
-    and must specify a procedure whereby the model passed to it is evaluated on the
-    task of interest, returning the resulting quantity (such as loss, loss gradient, etc).
-
-    :param model: the model defining the origin point of the plane in parameter space
-    :param metric: function of form evaluation_f(model), used to evaluate model loss
-    :param distance: maximum distance in parameter space from the start point
-    :param steps: at how many steps from start to end the model is evaluated
-    :param normalization: normalization of direction vectors, must be one of 'filter', 'layer', 'model'
-    :param deepcopy_model: indicates whether the method will deepcopy the model(s) to avoid aliasing
-    :return: 1-d array of loss values along the line connecting start and end models
+    For odd ``steps``, ``result[steps // 2, steps // 2]`` evaluates at the exact
+    bit-for-bit unperturbed parameters of ``model``. For even ``steps``, the
+    grid is strictly symmetric around ``model``. When ``deepcopy_model=False``
+    and ``restore_model=True`` (default), original parameters are restored in a
+    ``finally`` block.
     """
     model_start_wrapper = wrap_model(copy.deepcopy(model) if deepcopy_model else model)
+    snapshot = model_start_wrapper.snapshot_parameters() if (not deepcopy_model and restore_model) else None
 
-    start_point = model_start_wrapper.get_module_parameters()
-    dir_one = rand_n_like(start_point)
-    dir_two = orthogonal_to(dir_one)
+    try:
+        start_point = model_start_wrapper.get_module_parameters()
+        half_one = rand_n_like(start_point)
+        half_two = orthogonal_to(half_one)
 
-    if normalization == 'model':
-        dir_one.model_normalize_(start_point)
-        dir_two.model_normalize_(start_point)
-    elif normalization == 'layer':
-        dir_one.layer_normalize_(start_point)
-        dir_two.layer_normalize_(start_point)
-    elif normalization == 'filter':
-        dir_one.filter_normalize_(start_point)
-        dir_two.filter_normalize_(start_point)
-    elif normalization is None:
-        pass
-    else:
-        raise AttributeError('Unsupported normalization argument. Supported values are model, layer, and filter')
+        _normalize_direction(half_one, start_point, normalization)
+        _normalize_direction(half_two, start_point, normalization)
 
-    # scale to match steps and total distance
-    dir_one.mul_(((start_point.model_norm() * distance) / steps) / dir_one.model_norm())
-    dir_two.mul_(((start_point.model_norm() * distance) / steps) / dir_two.model_norm())
-    # Move start point so that original start params will be in the center of the plot
-    dir_one.mul_(steps / 2)
-    dir_two.mul_(steps / 2)
-    start_point.sub_(dir_one)
-    start_point.sub_(dir_two)
-    dir_one.truediv_(steps / 2)
-    dir_two.truediv_(steps / 2)
+        target_norm = start_point.model_norm(2) * float(distance)
+        _scale_direction(half_one, target_norm)
+        _scale_direction(half_two, target_norm)
 
-    if use_ray or USE_PARALLEL:
-        return _evaluate_plane_parallel(start_point, dir_one, dir_two, steps, metric, model_start_wrapper, distance, export, num_workers)
-    return _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_start_wrapper, distance, export)
-
+        if use_ray or USE_PARALLEL:
+            return _evaluate_plane_parallel(
+                start_point,
+                half_one,
+                half_two,
+                int(steps),
+                metric,
+                model_start_wrapper,
+                distance=distance,
+                export=export,
+                num_workers=num_workers,
+                centered=True,
+            )
+        return _evaluate_plane(
+            start_point,
+            half_one,
+            half_two,
+            int(steps),
+            metric,
+            model_start_wrapper,
+            distance=distance,
+            export=export,
+            centered=True,
+        )
+    finally:
+        if snapshot is not None:
+            model_start_wrapper.restore_parameters(snapshot)

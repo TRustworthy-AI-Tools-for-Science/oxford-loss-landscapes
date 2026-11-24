@@ -203,9 +203,14 @@ class ModelParameters:
         :param order: norm order, e.g. 2 for L2 norm
         :return: none
         """
+        eps = 1e-12
+        self_norm = self.model_norm(order)
+        if self_norm <= eps:
+            return
+        scale = ref_point.model_norm(order) / self_norm
         with torch.no_grad():
             for parameter in self.parameters:
-                parameter *= (ref_point.model_norm(order) / self.model_norm())
+                parameter *= scale
 
     def layer_normalize_(self, ref_point: 'ModelParameters', order=2):
         """
@@ -214,34 +219,46 @@ class ModelParameters:
         :param order: norm order, e.g. 2 for L2 norm
         :return: none
         """
+        eps = 1e-12
         with torch.no_grad():
             for layer_idx, parameter in enumerate(self.parameters, 0):
-                parameter *= (ref_point.layer_norm(layer_idx, order) / self.layer_norm(layer_idx, order))
+                self_norm = self.layer_norm(layer_idx, order)
+                if self_norm > eps:
+                    parameter *= (ref_point.layer_norm(layer_idx, order) / self_norm)
 
     def filter_normalize_(self, ref_point: 'ModelParameters', order=2):
         """
         In-place filter-wise normalization of the tensor.
+        Handles 0-D scalar parameters, 1-D bias/vector parameters, and
+        2-D+ weight tensors safely.
         :param ref_point: use this model's filter norms, if given
         :param order: norm order, e.g. 2 for L2 norm
         :return: none
         """
         eps = 1e-12  # Small epsilon to prevent division by zero
-        
+
         with torch.no_grad():
             for l in range(len(self.parameters)):
-                # normalize one-dimensional bias vectors
-                if len(self.parameters[l].size()) == 1:
-                    ref_norm = ref_point.parameters[l].norm(order)
-                    self_norm = self.parameters[l].norm(order)
+                param = self.parameters[l]
+                ref_param = ref_point.parameters[l]
+                # normalize 0-D scalar parameters (e.g. MLFF scale/shift params)
+                if param.ndim == 0:
+                    self_norm = param.abs().item()
                     if self_norm > eps:
-                        self.parameters[l] *= (ref_norm / self_norm)
-                # normalize two-dimensional weight vectors
+                        param *= (ref_param.abs().item() / self_norm)
+                # normalize 1-D bias/vector parameters
+                elif param.ndim == 1:
+                    ref_norm = ref_param.norm(order).item()
+                    self_norm = param.norm(order).item()
+                    if self_norm > eps:
+                        param *= (ref_norm / self_norm)
+                # normalize 2-D+ weight tensors per filter (dim 0)
                 else:
-                    for f in range(len(self.parameters[l])):
+                    for f in range(param.shape[0]):
                         ref_filter_norm = ref_point.filter_norm((l, f), order)
                         self_filter_norm = self.filter_norm((l, f), order)
                         if self_filter_norm > eps:
-                            self.parameters[l][f] *= ref_filter_norm / self_filter_norm
+                            param[f] *= ref_filter_norm / self_filter_norm
 
     def model_norm(self, order=2) -> float:
         """
@@ -249,31 +266,29 @@ class ModelParameters:
         :param order: norm order, e.g. 2 for L2 norm
         :return: L-norm of tensor
         """
-        # L-n norm of model where we treat the model as a flat other
+        # L-n norm of model where we treat the model as a flat vector
         return math.pow(sum([
-            torch.pow(layer, order).sum().item()
+            torch.pow(torch.abs(layer), order).sum().item()
             for layer in self.parameters
         ]), 1.0 / order)
 
     def layer_norm(self, index, order=2) -> float:
         """
-        Returns a list of layer-wise L-norms of the tensor.
+        Returns the layer-wise L-norm of the specified parameter tensor.
         :param order: norm order, e.g. 2 for L2 norm
         :param index: layer index
-        :return: list of L-norms of layers
+        :return: L-norm of layer
         """
-        # L-n norms of layer where we treat each layer as a flat other
-        return math.pow(torch.pow(self.parameters[index], order).sum().item(), 1.0 / order)
+        return math.pow(torch.pow(torch.abs(self.parameters[index]), order).sum().item(), 1.0 / order)
 
     def filter_norm(self, index, order=2) -> float:
         """
-        Returns a 2D list of filter-wise L-norms of the tensor.
+        Returns the L-norm of a specific filter within a layer.
         :param order: norm order, e.g. 2 for L2 norm
         :param index: tuple with layer index and filter index
-        :return: list of L-norms of filters
+        :return: L-norm of filter
         """
-        # L-n norm of each filter where we treat each layer as a flat other
-        return math.pow(torch.pow(self.parameters[index[0]][index[1]], order).sum().item(), 1.0 / order)
+        return math.pow(torch.pow(torch.abs(self.parameters[index[0]][index[1]]), order).sum().item(), 1.0 / order)
 
     def as_numpy(self) -> np.ndarray:
         """
@@ -325,12 +340,14 @@ def rand_n_like(example_vector: ModelParameters) -> ModelParameters:
 def orthogonal_to(vector: ModelParameters) -> ModelParameters:
     """
     Create a new ModelParameters object of size and shape compatible with the given
-    example vector, such that the two vectors are very nearly orthogonal.
+    example vector, such that the two vectors are orthogonal.
     :param vector: original vector
-    :return: new vector that is very nearly orthogonal to original vector
+    :return: new vector orthogonal to original vector
     """
     new_vector = rand_n_like(vector)
-    new_vector = new_vector - new_vector.dot(vector) * vector / math.pow(vector.model_norm(2), 2)
+    norm_sq = math.pow(vector.model_norm(2), 2)
+    if norm_sq > 1e-24:
+        new_vector = new_vector - (new_vector.dot(vector) / norm_sq) * vector
     return new_vector
 
 
@@ -354,19 +371,19 @@ def floordiv(vector: ModelParameters, scalar) -> ModelParameters:
     return vector // scalar
 
 
-def filter_normalize(tensor, order=2) -> ModelParameters:
+def filter_normalize(tensor: ModelParameters, ref_point: ModelParameters, order=2) -> ModelParameters:
     new_tensor = copy.deepcopy(tensor)
-    new_tensor.filter_normalize_(order)
+    new_tensor.filter_normalize_(ref_point, order=order)
     return new_tensor
 
 
-def layer_normalize(tensor, order) -> ModelParameters:
+def layer_normalize(tensor: ModelParameters, ref_point: ModelParameters, order=2) -> ModelParameters:
     new_tensor = copy.deepcopy(tensor)
-    new_tensor.layer_normalize_(order)
+    new_tensor.layer_normalize_(ref_point, order=order)
     return new_tensor
 
 
-def model_normalize(tensor, order) -> ModelParameters:
+def model_normalize(tensor: ModelParameters, ref_point: ModelParameters, order=2) -> ModelParameters:
     new_tensor = copy.deepcopy(tensor)
-    new_tensor.model_normalize_(order)
+    new_tensor.model_normalize_(ref_point, order=order)
     return new_tensor

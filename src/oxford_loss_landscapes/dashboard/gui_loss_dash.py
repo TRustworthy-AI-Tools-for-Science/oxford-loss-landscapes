@@ -56,7 +56,7 @@ def convert_slider_to_data_ranges(
     return slider_values
 
 
-def get_landscape_summary(slider_value_data, slider_step_data, landscape_data, distance):
+def get_landscape_summary(slider_value_data, slider_step_data, landscape_data, coordinate_bounds):
     """
     Returns text summary of loss landscape from current selection.
     """
@@ -64,22 +64,23 @@ def get_landscape_summary(slider_value_data, slider_step_data, landscape_data, d
     landscape_min = np.min(landscape)
     landscape_max = np.max(landscape)
     landscape_range = landscape_max - landscape_min
-    row_min = int((slider_value_data[0] - 0) / slider_step_data['x_step'])
-    row_max = int((slider_value_data[1] - 0) / slider_step_data['x_step'])
-    col_min = int((slider_value_data[2] - 0) / slider_step_data['y_step'])
-    col_max = int((slider_value_data[3] - 0) / slider_step_data['y_step'])
-    
-    min_val = np.min(landscape[row_min:row_max+1, col_min:col_max+1])
-    min_idx = np.argmin(landscape[row_min:row_max+1, col_min:col_max+1])
-    min_row, min_col = np.unravel_index(min_idx, landscape.shape)
-    min_dist1 = round(((min_row+row_min)*slider_step_data['x_step']*distance)-distance/2,2)
-    min_dist2 = round(((min_col+col_min)*slider_step_data['y_step']*distance)-distance/2,2)
+    n_rows, n_cols = landscape.shape
+    row_min = int(np.clip(round(slider_value_data[0] / slider_step_data['x_step']), 0, n_rows - 1))
+    row_max = int(np.clip(round(slider_value_data[1] / slider_step_data['x_step']), row_min, n_rows - 1))
+    col_min = int(np.clip(round(slider_value_data[2] / slider_step_data['y_step']), 0, n_cols - 1))
+    col_max = int(np.clip(round(slider_value_data[3] / slider_step_data['y_step']), col_min, n_cols - 1))
+    coordinate_min, coordinate_max = coordinate_bounds
 
-    max_val = np.max(landscape[row_min:row_max+1, col_min:col_max+1])
-    max_idx = np.argmax(landscape[row_min:row_max+1, col_min:col_max+1])
-    max_row, max_col = np.unravel_index(max_idx, landscape.shape)
-    max_dist1 = round(((max_row+row_min)*slider_step_data['x_step']*distance)-distance/2,2)
-    max_dist2 = round(((max_col+col_min)*slider_step_data['y_step']*distance)-distance/2,2)
+    sub = landscape[row_min:row_max + 1, col_min:col_max + 1]
+    min_val = float(np.min(sub))
+    min_row, min_col = np.unravel_index(int(np.argmin(sub)), sub.shape)
+    min_dist1 = round(((min_row + row_min) * slider_step_data['x_step'] * (coordinate_max - coordinate_min)) + coordinate_min, 2)
+    min_dist2 = round(((min_col + col_min) * slider_step_data['y_step'] * (coordinate_max - coordinate_min)) + coordinate_min, 2)
+
+    max_val = float(np.max(sub))
+    max_row, max_col = np.unravel_index(int(np.argmax(sub)), sub.shape)
+    max_dist1 = round(((max_row + row_min) * slider_step_data['x_step'] * (coordinate_max - coordinate_min)) + coordinate_min, 2)
+    max_dist2 = round(((max_col + col_min) * slider_step_data['y_step'] * (coordinate_max - coordinate_min)) + coordinate_min, 2)
 
     if min_val < landscape_min+(slider_value_data[4]*landscape_range):
         min_val = landscape_min+(slider_value_data[4]*landscape_range)
@@ -230,8 +231,17 @@ def load_landscape_data(landscape_file):
         toml_file = f"{base}.toml"
         with open(os.path.join(results_dir, toml_file), "rb") as f:
             config = tomllib.load(f)
-        x = np.linspace(-float(config['distance'])/2, float(config['distance'])/2, landscape.shape[0])
-        y = np.linspace(-float(config['distance'])/2, float(config['distance'])/2, landscape.shape[1])
+        distance = float(config['distance'])
+        if 'coordinate_min' in config and 'coordinate_max' in config:
+            coordinate_bounds = (
+                float(config['coordinate_min']),
+                float(config['coordinate_max']),
+            )
+        else:
+            coordinate_bounds = (-distance / 2, distance / 2)
+        x = np.linspace(*coordinate_bounds, landscape.shape[0])
+        y = np.linspace(*coordinate_bounds, landscape.shape[1])
+        config['coordinate_min'], config['coordinate_max'] = coordinate_bounds
         slider_min = {
             'x_min': float(np.min(x)),
             'y_min': float(np.min(y)), 
@@ -356,7 +366,12 @@ def update_figures(
         
         # Plot max / min / origin points on figure 2
         slider_values = [x_min, x_max, y_min, y_max, z_min, z_max]
-        summary = get_landscape_summary(slider_values, slider_step_data, landscape_data, float(config_data['distance']))
+        summary = get_landscape_summary(
+            slider_values,
+            slider_step_data,
+            landscape_data,
+            (float(config_data['coordinate_min']), float(config_data['coordinate_max'])),
+        )
 
         layout = dict(
             scene=dict(
@@ -477,7 +492,12 @@ def update_summary(xmin_val, xmax_val, ymin_val, ymax_val, zmin_val, zmax_val, s
         return dash.no_update
     
     slider_values = [xmin_val, xmax_val, ymin_val, ymax_val, zmin_val, zmax_val]
-    summary = get_landscape_summary(slider_values, slider_step_data, landscape_data, float(config_data['distance']))
+    summary = get_landscape_summary(
+        slider_values,
+        slider_step_data,
+        landscape_data,
+        (float(config_data['coordinate_min']), float(config_data['coordinate_max'])),
+    )
     lol_summary_txt = (
         f"Minimum Loss: {summary['min_val']:.4f} [{summary['min_dist1']}, {summary['min_dist2']}]\n"
         f"Maximum Loss: {summary['max_val']:.4f} [{summary['max_dist1']}, {summary['max_dist2']}]\n"
