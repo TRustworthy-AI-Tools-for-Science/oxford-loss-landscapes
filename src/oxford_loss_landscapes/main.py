@@ -52,31 +52,94 @@ def _normalize_direction(
     return direction
 
 
-def _evaluate_plane(start_point, dir_one, dir_two, steps, metric, model_wrapper, distance=1.0, export=False):
+def _set_params_offset(
+    target_params: ModelParameters,
+    base_tensors: typing.Sequence[torch.Tensor],
+    alpha: float = 0.0,
+    dir_one: typing.Optional[ModelParameters] = None,
+    beta: float = 0.0,
+    dir_two: typing.Optional[ModelParameters] = None,
+) -> None:
+    """Set ``target_params`` in-place to ``base + alpha * dir_one + beta * dir_two``.
+
+    Computing every grid point directly from the immutable baseline snapshot
+    eliminates cumulative floating-point drift across steps and guarantees that
+    ``(alpha=0, beta=0)`` evaluates at the exact bit-for-bit original weights.
     """
-    Helper function to evaluate a planar region in parameter space.
-    Evaluates a (steps x steps) grid with snake traversal so the center index
-    ``(steps // 2, steps // 2)`` aligns with the original model parameters for
-    odd ``steps``.
+    with torch.no_grad():
+        for idx, base in enumerate(base_tensors):
+            if (dir_one is None or alpha == 0.0) and (dir_two is None or beta == 0.0):
+                target_params.parameters[idx].copy_(base)
+                continue
+            val = base.clone()
+            if dir_one is not None and alpha != 0.0:
+                val.add_(dir_one[idx], alpha=float(alpha))
+            if dir_two is not None and beta != 0.0:
+                val.add_(dir_two[idx], alpha=float(beta))
+            target_params.parameters[idx].copy_(val)
+
+
+def _centered_grid_coords(steps: int) -> np.ndarray:
+    """Return symmetric 1D grid coordinates in ``[-1, +1]`` centered at ``0``.
+
+    - For odd ``steps``, ``coords[steps // 2] == 0.0`` exactly.
+    - For even ``steps``, ``coords`` is strictly symmetric around ``0.0``.
+    - For ``steps <= 1``, returns ``np.array([0.0])``.
     """
+    steps_int = int(steps)
+    if steps_int <= 1:
+        return np.array([0.0], dtype=float)
+    coords = np.linspace(-1.0, 1.0, steps_int, dtype=float)
+    if steps_int % 2 == 1:
+        coords[steps_int // 2] = 0.0
+    return coords
+
+
+def _evaluate_plane(
+    start_point,
+    dir_one,
+    dir_two,
+    steps,
+    metric,
+    model_wrapper,
+    distance=1.0,
+    export=False,
+    *,
+    centered: bool = False,
+):
+    """Evaluate a 2D planar region in parameter space with zero cumulative drift.
+
+    When ``centered=True``, ``start_point`` is the unperturbed center ``theta_0``
+    and ``dir_one``/``dir_two`` are half-span vectors; grid coordinates span
+    ``[-1, +1] x [-1, +1]`` so ``(steps // 2, steps // 2)`` evaluates at exact
+    ``theta_0`` for odd ``steps`` and the grid is strictly symmetric around
+    ``theta_0`` for even ``steps``.
+
+    When ``centered=False`` (legacy direct-call mode), ``start_point`` is the
+    grid corner and ``dir_one``/``dir_two`` are per-step increments evaluated at
+    ``start_point + i * dir_one + j * dir_two`` for ``i, j in range(steps)``.
+    """
+    steps_int = int(steps)
+    target_params = model_wrapper.get_module_parameters()
+    base_tensors = [p.detach().clone() for p in start_point]
+    coords = _centered_grid_coords(steps_int) if centered else np.arange(steps_int, dtype=float)
+
     data_matrix = []
-
-    for i in trange(steps, desc='Calculating Surface...'):
+    for alpha in trange(steps_int, desc='Calculating Surface...'):
+        a_val = float(coords[alpha])
         data_column = []
-
-        for j in range(steps):
-            if i % 2 == 0:
-                data_column.append(metric(model_wrapper))
-                if j < steps - 1:
-                    start_point.add_(dir_two)
-            else:
-                data_column.insert(0, metric(model_wrapper))
-                if j < steps - 1:
-                    start_point.sub_(dir_two)
-
+        for beta in range(steps_int):
+            b_val = float(coords[beta])
+            _set_params_offset(
+                target_params,
+                base_tensors,
+                alpha=a_val,
+                dir_one=dir_one,
+                beta=b_val,
+                dir_two=dir_two,
+            )
+            data_column.append(metric(model_wrapper))
         data_matrix.append(data_column)
-        if i < steps - 1:
-            start_point.add_(dir_one)
 
     if export:
         _export_plane_to_npy(data_matrix, distance)
@@ -105,16 +168,37 @@ def _export_plane_to_npy(data_matrix, distance):
 
 
 def _evaluate_plane_parallel(
-    start_point, dir_one, dir_two, steps, metric, model_wrapper,
-    distance=1.0, export=False, num_workers=None,
+    start_point,
+    dir_one,
+    dir_two,
+    steps,
+    metric,
+    model_wrapper,
+    distance=1.0,
+    export=False,
+    num_workers=None,
+    *,
+    centered: bool = False,
 ):
     """Parallel version of _evaluate_plane using Ray remote workers.
 
-    Each row of the evaluation grid is dispatched to an independent Ray worker.
-    Falls back to sequential evaluation if Ray is unavailable or fails.
+    Each row of the evaluation grid is dispatched to an independent Ray worker
+    and computed directly from the baseline tensors (zero cumulative drift,
+    exact match with ``_evaluate_plane``). Falls back to sequential evaluation
+    if Ray is unavailable or fails.
     """
     def _sequential_eval(sp, d1, d2, steps_, metric_, wrapper_):
-        return _evaluate_plane(sp, d1, d2, int(steps_), metric_, wrapper_, distance=distance, export=export)
+        return _evaluate_plane(
+            sp,
+            d1,
+            d2,
+            int(steps_),
+            metric_,
+            wrapper_,
+            distance=distance,
+            export=export,
+            centered=centered,
+        )
 
     if ray is None or not ray.is_initialized():
         try:
@@ -131,36 +215,46 @@ def _evaluate_plane_parallel(
     except Exception:
         available_cpus = multiprocessing.cpu_count()
 
+    steps_int = int(steps)
     if num_workers is None:
-        num_workers = min(steps, max(1, available_cpus))
+        num_workers = min(steps_int, max(1, available_cpus))
 
     @ray.remote
-    def eval_row(row_start_params, dir_two_params, steps_, metric_fn, wrapper_, row_idx):
+    def eval_row(base_params, dir_one_params, dir_two_params, alpha_val, beta_coords, metric_fn, wrapper_):
         local_wrapper = copy.deepcopy(wrapper_)
         local_params = local_wrapper.get_module_parameters()
-        with torch.no_grad():
-            for idx in range(len(local_params)):
-                local_params.parameters[idx].copy_(row_start_params[idx])
         data_column = []
-        for j in range(int(steps_)):
-            val = metric_fn(local_wrapper)
-            data_column.append(val)
-            if j < int(steps_) - 1:
-                with torch.no_grad():
-                    for idx in range(len(local_params)):
-                        local_params.parameters[idx].add_(dir_two_params[idx])
+        for b_val in beta_coords:
+            with torch.no_grad():
+                for idx, base in enumerate(base_params):
+                    if alpha_val == 0.0 and b_val == 0.0:
+                        local_params.parameters[idx].copy_(base)
+                    else:
+                        val = base.clone()
+                        if alpha_val != 0.0:
+                            val.add_(dir_one_params[idx], alpha=float(alpha_val))
+                        if b_val != 0.0:
+                            val.add_(dir_two_params[idx], alpha=float(b_val))
+                        local_params.parameters[idx].copy_(val)
+            data_column.append(metric_fn(local_wrapper))
         return data_column
 
-    row_params = []
-    current = start_point
-    dir_two_data = [p.data.clone().detach() for p in dir_two]
-    for i in range(int(steps)):
-        row_params.append([p.data.clone().detach() for p in current])
-        current = current + dir_one
+    coords = _centered_grid_coords(steps_int) if centered else np.arange(steps_int, dtype=float)
+    base_data = [p.detach().clone() for p in start_point]
+    dir_one_data = [p.detach().clone() for p in dir_one]
+    dir_two_data = [p.detach().clone() for p in dir_two]
 
     tasks = [
-        eval_row.remote(row_params[i], dir_two_data, steps, metric, model_wrapper, i)
-        for i in range(int(steps))
+        eval_row.remote(
+            base_data,
+            dir_one_data,
+            dir_two_data,
+            float(coords[i]),
+            coords.tolist(),
+            metric,
+            model_wrapper,
+        )
+        for i in range(steps_int)
     ]
 
     try:
@@ -196,7 +290,7 @@ def linear_interpolation(
 ) -> np.ndarray:
     """
     Evaluate ``metric`` at ``steps`` evenly spaced points along the line
-    connecting ``model_start`` to ``model_end``.
+    connecting ``model_start`` to ``model_start + distance * (model_end - model_start)``.
     """
     model_start_wrapper = wrap_model(copy.deepcopy(model_start) if deepcopy_model else model_start)
     end_model_wrapper = wrap_model(copy.deepcopy(model_end) if deepcopy_model else model_end)
@@ -205,14 +299,16 @@ def linear_interpolation(
     try:
         start_point = model_start_wrapper.get_module_parameters()
         end_point = end_model_wrapper.get_module_parameters()
-        span_steps = max(int(steps) - 1, 1)
-        direction = (end_point - start_point) * (float(distance) / span_steps)
+        base_tensors = [p.detach().clone() for p in start_point]
+        delta = end_point - start_point
+
+        steps_int = int(steps)
+        ts = np.array([0.0], dtype=float) if steps_int <= 1 else np.linspace(0.0, float(distance), steps_int)
 
         data_values = []
-        for idx in trange(int(steps), desc='Calculating...'):
+        for idx in trange(steps_int, desc='Calculating...'):
+            _set_params_offset(start_point, base_tensors, alpha=float(ts[idx]), dir_one=delta)
             data_values.append(metric(model_start_wrapper))
-            if idx < int(steps) - 1:
-                start_point.add_(direction)
     finally:
         if snapshot is not None:
             model_start_wrapper.restore_parameters(snapshot)
@@ -233,9 +329,10 @@ def random_line(
     Evaluate ``metric`` along a symmetric 1D random direction spanning
     ``[-distance, +distance]`` centered at ``model_start``.
 
-    For odd ``steps``, ``result[steps // 2]`` evaluates at the exact unperturbed
-    parameters of ``model_start``. When ``deepcopy_model=False`` and
-    ``restore_model=True`` (default), original parameters are restored in a
+    For odd ``steps``, ``result[steps // 2]`` evaluates at the exact bit-for-bit
+    unperturbed parameters of ``model_start``. For even ``steps``, grid points
+    are strictly symmetric around ``model_start``. When ``deepcopy_model=False``
+    and ``restore_model=True`` (default), original parameters are restored in a
     ``finally`` block, making this safe for non-deepcopyable modules such as
     ``e3nn`` / TorchScript MLFFs and ASE calculators.
     """
@@ -244,6 +341,7 @@ def random_line(
 
     try:
         start_point = model_start_wrapper.get_module_parameters()
+        base_tensors = [p.detach().clone() for p in start_point]
         direction = rand_n_like(start_point)
         _normalize_direction(direction, start_point, normalization)
 
@@ -251,19 +349,12 @@ def random_line(
         _scale_direction(direction, start_point.model_norm(2) * float(distance))
 
         steps_int = int(steps)
-        if steps_int <= 1:
-            return np.array([metric(model_start_wrapper)])
-
-        # Shift to -distance and step by (2 * distance) / (steps - 1) so
-        # index 0 is -distance, center (steps // 2 for odd) is 0, and last is +distance.
-        start_point.sub_(direction)
-        step_vec = direction * (2.0 / float(steps_int - 1))
+        coords = _centered_grid_coords(steps_int)
 
         data_values = []
         for idx in trange(steps_int, desc='Calculating...'):
+            _set_params_offset(start_point, base_tensors, alpha=float(coords[idx]), dir_one=direction)
             data_values.append(metric(model_start_wrapper))
-            if idx < steps_int - 1:
-                start_point.add_(step_vec)
     finally:
         if snapshot is not None:
             model_start_wrapper.restore_parameters(snapshot)
@@ -285,8 +376,11 @@ def planar_interpolation(
     restore_model: bool = True,
 ) -> np.ndarray:
     """
-    Evaluate ``metric`` over a 2D planar subspace defined by ``model_start`` and
-    two endpoint models ``model_end_one`` and ``model_end_two``.
+    Evaluate ``metric`` over a 2D planar subspace centered at ``model_start``
+    and spanned by ``model_end_one`` and ``model_end_two``.
+
+    For odd ``steps``, ``result[steps // 2, steps // 2]`` evaluates at the exact
+    unperturbed parameters of ``model_start``.
     """
     model_start_wrapper = wrap_model(copy.deepcopy(model_start) if deepcopy_model else model_start)
     model_end_one_wrapper = wrap_model(copy.deepcopy(model_end_one) if deepcopy_model else model_end_one)
@@ -296,9 +390,6 @@ def planar_interpolation(
     try:
         start_point = model_start_wrapper.get_module_parameters()
         steps_int = int(steps)
-        if steps_int <= 1:
-            return np.array([[metric(model_start_wrapper)]])
-        span_steps = steps_int - 1
 
         if eigen_models:
             half_one = model_end_one_wrapper.get_module_parameters() * float(distance)
@@ -307,16 +398,28 @@ def planar_interpolation(
             half_one = (model_end_one_wrapper.get_module_parameters() - start_point) * float(distance)
             half_two = (model_end_two_wrapper.get_module_parameters() - start_point) * float(distance)
 
-        start_point.sub_(half_one)
-        start_point.sub_(half_two)
-        dir_one = half_one * (2.0 / float(span_steps))
-        dir_two = half_two * (2.0 / float(span_steps))
-
         if use_ray or USE_PARALLEL:
             return _evaluate_plane_parallel(
-                start_point, dir_one, dir_two, steps_int, metric, model_start_wrapper, num_workers=num_workers
+                start_point,
+                half_one,
+                half_two,
+                steps_int,
+                metric,
+                model_start_wrapper,
+                distance=distance,
+                num_workers=num_workers,
+                centered=True,
             )
-        return _evaluate_plane(start_point, dir_one, dir_two, steps_int, metric, model_start_wrapper)
+        return _evaluate_plane(
+            start_point,
+            half_one,
+            half_two,
+            steps_int,
+            metric,
+            model_start_wrapper,
+            distance=distance,
+            centered=True,
+        )
     finally:
         if snapshot is not None:
             model_start_wrapper.restore_parameters(snapshot)
@@ -340,13 +443,15 @@ def hessian_plane(
     dataset_size: typing.Optional[int] = None,
 ) -> np.ndarray:
     """
-    Evaluate ``metric`` along a planar subspace spanned by the dominant
-    parameter-Hessian eigenvector (computed via VR-PCA) and a random orthogonal
-    direction.
+    Evaluate ``metric`` along a planar subspace centered at ``model`` and
+    spanned by the dominant parameter-Hessian eigenvector (computed via VR-PCA)
+    and a random orthogonal direction.
 
-    Supports both standard tensor batches and graph/dict MLFF inputs via
-    ``forward_fn`` or ``loss_callable``, and safely pads frozen
-    (``requires_grad=False``) parameters with zeros.
+    For odd ``steps``, ``result[steps // 2, steps // 2]`` evaluates at the exact
+    bit-for-bit unperturbed parameters of ``model``. Supports both standard
+    tensor batches and graph/dict MLFF inputs via ``forward_fn`` or
+    ``loss_callable``, and safely pads frozen (``requires_grad=False``)
+    parameters with zeros.
     """
     from .hessian.vrpca import top_hessian_eigenpair_vrpca, VRPCAConfig
     from .hessian.vrpca.utils import collect_parameters, unflatten_like
@@ -392,20 +497,17 @@ def hessian_plane(
         _scale_direction(half_one, target_norm)
         _scale_direction(half_two, target_norm)
 
-        steps_int = int(steps)
-        if steps_int <= 1:
-            data = np.array([[metric(model_wrapper)]])
-            if export:
-                _export_plane_to_npy(data, distance)
-                return None
-            return data
-        span_steps = steps_int - 1
-        start_point.sub_(half_one)
-        start_point.sub_(half_two)
-        dir_one = half_one * (2.0 / float(span_steps))
-        dir_two = half_two * (2.0 / float(span_steps))
-
-        return _evaluate_plane(start_point, dir_one, dir_two, steps_int, metric, model_wrapper, distance, export)
+        return _evaluate_plane(
+            start_point,
+            half_one,
+            half_two,
+            int(steps),
+            metric,
+            model_wrapper,
+            distance=distance,
+            export=export,
+            centered=True,
+        )
     finally:
         if snapshot is not None:
             model_wrapper.restore_parameters(snapshot)
@@ -428,8 +530,9 @@ def random_plane(
     ``[-distance, +distance]^2`` centered at ``model``.
 
     For odd ``steps``, ``result[steps // 2, steps // 2]`` evaluates at the exact
-    unperturbed parameters of ``model``. When ``deepcopy_model=False`` and
-    ``restore_model=True`` (default), original parameters are restored in a
+    bit-for-bit unperturbed parameters of ``model``. For even ``steps``, the
+    grid is strictly symmetric around ``model``. When ``deepcopy_model=False``
+    and ``restore_model=True`` (default), original parameters are restored in a
     ``finally`` block.
     """
     model_start_wrapper = wrap_model(copy.deepcopy(model) if deepcopy_model else model)
@@ -447,24 +550,30 @@ def random_plane(
         _scale_direction(half_one, target_norm)
         _scale_direction(half_two, target_norm)
 
-        steps_int = int(steps)
-        if steps_int <= 1:
-            data = np.array([[metric(model_start_wrapper)]])
-            if export:
-                _export_plane_to_npy(data, distance)
-                return None
-            return data
-        span_steps = steps_int - 1
-        start_point.sub_(half_one)
-        start_point.sub_(half_two)
-        dir_one = half_one * (2.0 / float(span_steps))
-        dir_two = half_two * (2.0 / float(span_steps))
-
         if use_ray or USE_PARALLEL:
             return _evaluate_plane_parallel(
-                start_point, dir_one, dir_two, steps_int, metric, model_start_wrapper, distance, export, num_workers
+                start_point,
+                half_one,
+                half_two,
+                int(steps),
+                metric,
+                model_start_wrapper,
+                distance=distance,
+                export=export,
+                num_workers=num_workers,
+                centered=True,
             )
-        return _evaluate_plane(start_point, dir_one, dir_two, steps_int, metric, model_start_wrapper, distance, export)
+        return _evaluate_plane(
+            start_point,
+            half_one,
+            half_two,
+            int(steps),
+            metric,
+            model_start_wrapper,
+            distance=distance,
+            export=export,
+            centered=True,
+        )
     finally:
         if snapshot is not None:
             model_start_wrapper.restore_parameters(snapshot)

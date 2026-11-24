@@ -49,7 +49,7 @@ def trapezoidal_area(x_range: tuple, y_range: tuple, z_array: np.array):
     # Fix: Use linspace to create exactly the right number of points to match z_array
     X = np.linspace(x_min, x_max, num_x_steps)
     Y = np.linspace(y_min, y_max, num_y_steps)
-    X, Y = np.meshgrid(X, Y)
+    X, Y = np.meshgrid(X, Y, indexing='ij')
     Z = z_array
 
     xyz = np.array([X.flatten(), Y.flatten(), Z.flatten()]).T

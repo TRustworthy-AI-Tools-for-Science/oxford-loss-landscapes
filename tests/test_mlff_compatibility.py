@@ -94,6 +94,7 @@ def test_random_line_respects_distance_centers_and_restores_weights():
 
 def test_random_plane_exact_center_and_inplace_restore():
     import oxford_loss_landscapes as oll
+    from oxford_loss_landscapes.metrics.metric import Metric
     from oxford_loss_landscapes.metrics.sl_metrics import Loss
 
     torch.manual_seed(1)
@@ -106,13 +107,44 @@ def test_random_plane_exact_center_and_inplace_restore():
     orig_weights = [p.detach().clone() for p in model.parameters()]
     orig_loss = criterion(model(X), y).item()
 
+    # Larger odd grid (21x21) on float32 must hit exact bit-for-bit origin (zero drift)
     plane = oll.random_plane(
-        model, metric, distance=0.25, steps=7, normalization="filter", deepcopy_model=False
+        model, metric, distance=0.25, steps=21, normalization="filter", deepcopy_model=False
     )
-    assert plane.shape == (7, 7)
-    assert plane[3, 3] == pytest.approx(orig_loss, abs=1e-5)
+    assert plane.shape == (21, 21)
+    assert plane[10, 10] == pytest.approx(orig_loss, abs=1e-12)
     for p, saved in zip(model.parameters(), orig_weights):
         assert torch.allclose(p, saved)
+
+    # Pure quadratic bowl centered at orig_weights must be strictly symmetric
+    # for EVEN steps (no half-step shift!) and hit exact 0.0 at center for ODD steps.
+    class _QuadraticDistanceMetric(Metric):
+        def __call__(self, model_wrapper):
+            return float(
+                sum(
+                    torch.sum((cur - ref) ** 2).item()
+                    for cur, ref in zip(model_wrapper.get_module_parameters(), orig_weights)
+                )
+            )
+
+    quad_metric = _QuadraticDistanceMetric()
+    even_plane = oll.random_plane(
+        model, quad_metric, distance=0.5, steps=6, normalization="filter", deepcopy_model=False
+    )
+    assert even_plane.shape == (6, 6)
+    assert np.allclose(even_plane, even_plane[::-1, ::-1], atol=1e-5)
+
+    even_line = oll.random_line(
+        model, quad_metric, distance=0.5, steps=6, normalization="filter", deepcopy_model=False
+    )
+    assert even_line.shape == (6,)
+    assert np.allclose(even_line, even_line[::-1], atol=1e-5)
+
+    odd_line = oll.random_line(
+        model, quad_metric, distance=0.5, steps=21, normalization="filter", deepcopy_model=False
+    )
+    assert odd_line[10] == 0.0
+    assert np.allclose(odd_line, odd_line[::-1], atol=1e-5)
 
 
 def test_vrpca_and_hessian_plane_on_multihead_dict_mlff():
