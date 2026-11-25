@@ -37,6 +37,7 @@ class LossGradient(Metric):
 
     def __call__(self, model_wrapper: ModelWrapper) -> np.ndarray:
         params = list(model_wrapper.get_module_parameters()._get_parameters())
+        orig_requires_grad = [p.requires_grad for p in params]
         for p in params:
             p.requires_grad_(True)
         try:
@@ -48,8 +49,8 @@ class LossGradient(Metric):
                 for g, p in zip(grads, params)
             ])
         finally:
-            for p in params:
-                p.requires_grad_(False)
+            for p, req in zip(params, orig_requires_grad):
+                p.requires_grad_(req)
 
 
 class LossPerturbations(Metric):
@@ -66,20 +67,21 @@ class LossPerturbations(Metric):
         self.alpha = alpha
 
     def __call__(self, model_wrapper: ModelWrapper) -> np.ndarray:
-        # start point and directions
+        # start point and immutable baseline snapshot
         start_point = model_wrapper.get_module_parameters()
+        snapshot = model_wrapper.snapshot_parameters()
         start_loss = self.loss_fn(model_wrapper.forward(self.inputs), self.target).item()
 
-        # compute start loss and perturbed losses
         results = []
-        for _ in range(self.n_directions):
-            direction = rand_u_like(start_point)
-            start_point.add_(direction)
-
-            loss = self.loss_fn(model_wrapper.forward(self.inputs), self.target).item()
-            results.append(loss - start_loss)
-
-            start_point.sub_(direction)
+        try:
+            for _ in range(self.n_directions):
+                direction = rand_u_like(start_point) * float(self.alpha)
+                start_point.add_(direction)
+                loss = self.loss_fn(model_wrapper.forward(self.inputs), self.target).item()
+                results.append(loss - start_loss)
+                model_wrapper.restore_parameters(snapshot)
+        finally:
+            model_wrapper.restore_parameters(snapshot)
 
         return np.array(results)
 

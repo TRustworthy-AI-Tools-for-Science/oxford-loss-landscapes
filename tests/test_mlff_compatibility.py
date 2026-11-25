@@ -193,3 +193,75 @@ def test_vrpca_and_hessian_plane_on_multihead_dict_mlff():
     assert plane[2, 2] == pytest.approx(center_expected, abs=1e-5)
     for p, saved in zip(model.parameters(), orig_weights):
         assert torch.allclose(p, saved)
+
+
+def test_force_loss_vrpca_float64_hessian_and_metrics():
+    """Verify conservative force-matching loss ||-grad_q E_theta - F_*||^2,
+    fd_grad HVP fallback, float64 classical Hessians, and metric state safety."""
+    import oxford_loss_landscapes as oll
+    from oxford_loss_landscapes.hessian.hessian import (
+        hessian_vector_product,
+        small_hessian,
+    )
+    from oxford_loss_landscapes.metrics.sl_metrics import (
+        LossGradient,
+        LossPerturbations,
+    )
+
+    torch.manual_seed(11)
+    model = _SurrogateMultiHeadMLFF().double()
+    model.trainable_shift = nn.Parameter(torch.tensor(0.25, dtype=torch.float64))
+
+    pos_base = torch.randn(4, 3, dtype=torch.float64)
+    target_forces = torch.randn(4, 3, dtype=torch.float64)
+
+    def force_loss_callable(_indices):
+        pos = pos_base.detach().clone().requires_grad_(True)
+        energy = model({"positions": pos})["energy"] + model.trainable_shift
+        forces = -torch.autograd.grad(energy, pos, create_graph=True)[0]
+        return torch.mean((forces - target_forces) ** 2)
+
+    cfg_exact = oll.VRPCAConfig(batch_size=1, epochs=5, seed=0, hvp_mode="autograd")
+    cfg_fd = oll.VRPCAConfig(
+        batch_size=1, epochs=5, seed=0, hvp_mode="fd_grad", fd_eps=1e-6
+    )
+    orig_params = [p.detach().clone() for p in model.parameters()]
+    with torch.no_grad():
+        res_exact = oll.top_hessian_eigenpair_vrpca(
+            net=model, loss_callable=force_loss_callable, dataset_size=1, config=cfg_exact
+        )
+        res_fd = oll.top_hessian_eigenpair_vrpca(
+            net=model, loss_callable=force_loss_callable, dataset_size=1, config=cfg_fd
+        )
+    assert res_exact.eigenvalue == pytest.approx(res_fd.eigenvalue, rel=1e-3, abs=1e-4)
+    for p, saved in zip(model.parameters(), orig_params):
+        assert torch.allclose(p, saved)
+    assert not model.atomic_shift.requires_grad
+
+    # Classical small_hessian and hessian_vector_product on float64 model with frozen param
+    loss_f = force_loss_callable(None)
+    dense_h = small_hessian(model, loss_f)
+    assert dense_h.dtype == np.float64
+    assert not model.atomic_shift.requires_grad
+
+    loss_f2 = force_loss_callable(None)
+    hvp_op = hessian_vector_product(model, loss_f2)
+    probe = np.ones(dense_h.shape[0], dtype=np.float64)
+    assert np.allclose(hvp_op.matvec(probe), dense_h @ probe, atol=1e-6)
+
+    # LossGradient must preserve requires_grad flags & LossPerturbations must scale by alpha
+    mlp = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 1))
+    x = torch.randn(6, 3)
+    y = torch.randn(6, 1)
+    mse = nn.MSELoss()
+    _ = oll.point(mlp, LossGradient(mse, x, y))
+    assert all(p.requires_grad for p in mlp.parameters())
+
+    orig_mlp = [p.detach().clone() for p in mlp.parameters()]
+    torch.manual_seed(0)
+    pert_small = oll.point(mlp, LossPerturbations(mse, x, y, n_directions=4, alpha=1e-3))
+    torch.manual_seed(0)
+    pert_large = oll.point(mlp, LossPerturbations(mse, x, y, n_directions=4, alpha=1e-1))
+    assert np.max(np.abs(pert_large)) > np.max(np.abs(pert_small)) * 5.0
+    for p, saved in zip(mlp.parameters(), orig_mlp):
+        assert torch.equal(p, saved)

@@ -54,6 +54,8 @@ def top_hessian_eigenpair_vrpca(
         forward_fn=forward_fn,
         loss_callable=loss_callable,
         dataset_size=dataset_size,
+        hvp_mode=config.hvp_mode if config is not None else "auto",
+        fd_eps=config.fd_eps if config is not None else 1e-4,
     )
     return top_eigenpair_vrpca(oracle, config=config)
 
@@ -88,6 +90,8 @@ def min_hessian_eigenpair_vrpca(
         forward_fn=forward_fn,
         loss_callable=loss_callable,
         dataset_size=dataset_size,
+        hvp_mode=config.hvp_mode if config is not None else "auto",
+        fd_eps=config.fd_eps if config is not None else 1e-4,
     )
     result = top_eigenpair_vrpca(oracle, config=config)
     return replace(result, eigenvalue=-result.eigenvalue)

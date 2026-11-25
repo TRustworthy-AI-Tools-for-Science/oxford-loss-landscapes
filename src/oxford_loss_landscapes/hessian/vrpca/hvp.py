@@ -89,9 +89,15 @@ class HessianVectorProductOracle:
         forward_fn: Optional[Callable[[torch.nn.Module, Any], Any]] = None,
         loss_callable: Optional[Callable[[Optional[Sequence[int]]], torch.Tensor]] = None,
         dataset_size: Optional[int] = None,
+        hvp_mode: str = "auto",
+        fd_eps: float = 1e-4,
     ) -> None:
         if loss_callable is None and loss_fn is None:
             raise ValueError("Provide either `loss_fn` or `loss_callable`.")
+        if hvp_mode not in {"auto", "autograd", "fd_grad"}:
+            raise ValueError("hvp_mode must be 'auto', 'autograd', or 'fd_grad'")
+        if fd_eps <= 0:
+            raise ValueError("fd_eps must be positive")
 
         self.model = model
         self.loss_fn = loss_fn
@@ -104,6 +110,8 @@ class HessianVectorProductOracle:
         self._explicit_dataset_size = dataset_size
         self._spectral_norm_estimate: Optional[float] = None
         self.scale = float(scale)
+        self.hvp_mode = hvp_mode
+        self.fd_eps = float(fd_eps)
 
     @property
     def num_parameters(self) -> int:
@@ -126,70 +134,141 @@ class HessianVectorProductOracle:
             "or paired with an explicit `dataset_size`/`loss_callable`"
         )
 
-    def hvp(self, vector_list: TensorSequence, batch_indices: Optional[Sequence[int]] = None) -> TensorList:
-        self.model.eval()
-        self.model.zero_grad(set_to_none=True)
-
+    def _compute_loss(self, batch_indices: Optional[Sequence[int]] = None) -> torch.Tensor:
         if self.loss_callable is not None:
-            loss = self.loss_callable(batch_indices)
-        else:
-            if (
-                batch_indices is not None
-                and self.dataset_size > 1
-                and (
-                    isinstance(self.inputs, dict)
-                    or (hasattr(self.inputs, "to") and not isinstance(self.inputs, torch.Tensor))
-                )
-            ):
-                raise ValueError(
-                    "Minibatching graph/dict inputs with dataset_size > 1 requires "
-                    "an index-aware `loss_callable`."
-                )
-            is_graph_batch = isinstance(self.inputs, dict) or (
-                hasattr(self.inputs, "to") and not isinstance(self.inputs, torch.Tensor)
+            return self.loss_callable(batch_indices)
+        if (
+            batch_indices is not None
+            and self.dataset_size > 1
+            and (
+                isinstance(self.inputs, dict)
+                or (hasattr(self.inputs, "to") and not isinstance(self.inputs, torch.Tensor))
             )
-            selection_indices = None if is_graph_batch else batch_indices
-            xb = _apply_to_device(_select_batch(self.inputs, selection_indices), self.device)
-            yb = _apply_to_device(_select_batch(self.targets, selection_indices), self.device)
-            outputs = self.forward_fn(self.model, xb) if self.forward_fn is not None else self.model(xb)
-            loss = self.loss_fn(outputs, yb) if yb is not None else self.loss_fn(outputs)
+        ):
+            raise ValueError(
+                "Minibatching graph/dict inputs with dataset_size > 1 requires "
+                "an index-aware `loss_callable`."
+            )
+        is_graph_batch = isinstance(self.inputs, dict) or (
+            hasattr(self.inputs, "to") and not isinstance(self.inputs, torch.Tensor)
+        )
+        selection_indices = None if is_graph_batch else batch_indices
+        xb = _apply_to_device(_select_batch(self.inputs, selection_indices), self.device)
+        yb = _apply_to_device(_select_batch(self.targets, selection_indices), self.device)
+        outputs = self.forward_fn(self.model, xb) if self.forward_fn is not None else self.model(xb)
+        return self.loss_fn(outputs, yb) if yb is not None else self.loss_fn(outputs)
 
+    def _first_order_grads(self, batch_indices: Optional[Sequence[int]] = None) -> TensorList:
+        self.model.zero_grad(set_to_none=True)
+        loss = self._compute_loss(batch_indices)
         raw_grads = torch.autograd.grad(
             loss,
             self.params,
-            create_graph=True,
-            retain_graph=True,
-            allow_unused=True,
-        )
-
-        # Keep only parameters participating in the graph for second differentiation
-        active_indices = [idx for idx, g in enumerate(raw_grads) if g is not None and g.requires_grad]
-        if not active_indices:
-            return [torch.zeros_like(param) for param in self.params]
-
-        active_grads = [raw_grads[idx] for idx in active_indices]
-        active_params = [self.params[idx] for idx in active_indices]
-        active_vecs = [
-            vector_list[idx].to(device=self.params[idx].device, dtype=self.params[idx].dtype)
-            for idx in active_indices
-        ]
-
-        raw_hvp = torch.autograd.grad(
-            active_grads,
-            active_params,
-            grad_outputs=active_vecs,
+            create_graph=False,
             retain_graph=False,
             allow_unused=True,
         )
+        return [
+            g.detach() if g is not None else torch.zeros_like(param)
+            for param, g in zip(self.params, raw_grads)
+        ]
 
-        full_hvp: TensorList = [torch.zeros_like(param) for param in self.params]
-        for pos, idx in enumerate(active_indices):
-            if raw_hvp[pos] is not None:
-                full_hvp[idx] = raw_hvp[pos]
+    def _fd_grad_hvp(
+        self,
+        vector_list: TensorSequence,
+        batch_indices: Optional[Sequence[int]] = None,
+    ) -> TensorList:
+        """Central finite-difference HVP using only first-order parameter gradients.
 
-        if self.scale != 1.0:
-            return [tensor.mul(self.scale) for tensor in full_hvp]
-        return full_hvp
+        Essential for derivative-based losses (such as MLFF force-matching
+        losses ``||-grad_q E_theta(q) - F_*||^2``) when custom/scatter ops do
+        not implement third-order backward passes.
+        """
+        vecs = [
+            v.detach().to(device=param.device, dtype=param.dtype)
+            for param, v in zip(self.params, vector_list)
+        ]
+        sq_norm = sum(float((v * v).sum().item()) for v in vecs)
+        v_norm = math.sqrt(sq_norm)
+        if v_norm <= 1e-24:
+            return [torch.zeros_like(param) for param in self.params]
+
+        eps = self.fd_eps
+        unit_vecs = [v / v_norm for v in vecs]
+        snapshot = [param.detach().clone() for param in self.params]
+        try:
+            with torch.no_grad():
+                for param, base, u_vec in zip(self.params, snapshot, unit_vecs):
+                    param.copy_(base + eps * u_vec)
+            grads_plus = self._first_order_grads(batch_indices)
+
+            with torch.no_grad():
+                for param, base, u_vec in zip(self.params, snapshot, unit_vecs):
+                    param.copy_(base - eps * u_vec)
+            grads_minus = self._first_order_grads(batch_indices)
+        finally:
+            with torch.no_grad():
+                for param, base in zip(self.params, snapshot):
+                    param.copy_(base)
+
+        factor = (v_norm / (2.0 * eps)) * self.scale
+        return [(gp - gm) * factor for gp, gm in zip(grads_plus, grads_minus)]
+
+    def hvp(self, vector_list: TensorSequence, batch_indices: Optional[Sequence[int]] = None) -> TensorList:
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.enable_grad():
+                if self.hvp_mode == "fd_grad":
+                    return self._fd_grad_hvp(vector_list, batch_indices)
+
+                self.model.zero_grad(set_to_none=True)
+                loss = self._compute_loss(batch_indices)
+
+                raw_grads = torch.autograd.grad(
+                    loss,
+                    self.params,
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+
+                # Keep only parameters participating in the graph for second differentiation
+                active_indices = [idx for idx, g in enumerate(raw_grads) if g is not None and g.requires_grad]
+                if not active_indices:
+                    return [torch.zeros_like(param) for param in self.params]
+
+                active_grads = [raw_grads[idx] for idx in active_indices]
+                active_params = [self.params[idx] for idx in active_indices]
+                active_vecs = [
+                    vector_list[idx].to(device=self.params[idx].device, dtype=self.params[idx].dtype)
+                    for idx in active_indices
+                ]
+
+                try:
+                    raw_hvp = torch.autograd.grad(
+                        active_grads,
+                        active_params,
+                        grad_outputs=active_vecs,
+                        retain_graph=False,
+                        allow_unused=True,
+                    )
+                except RuntimeError:
+                    if self.hvp_mode == "auto":
+                        return self._fd_grad_hvp(vector_list, batch_indices)
+                    raise
+
+                full_hvp: TensorList = [torch.zeros_like(param) for param in self.params]
+                for pos, idx in enumerate(active_indices):
+                    if raw_hvp[pos] is not None:
+                        full_hvp[idx] = raw_hvp[pos].detach()
+
+                if self.scale != 1.0:
+                    return [tensor.mul(self.scale) for tensor in full_hvp]
+                return full_hvp
+        finally:
+            if was_training:
+                self.model.train(True)
 
     def full_hvp(self, vector_list: TensorSequence, tracker: Optional[HVPBudgetTracker] = None) -> TensorList:
         if tracker is not None:

@@ -20,6 +20,8 @@ class VRPCAConfig:
     budget: Optional[float] = None
     track_window: int = 5
     inner_loop_factor: float = 1.0
+    hvp_mode: str = "auto"
+    fd_eps: float = 1e-4
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -36,6 +38,10 @@ class VRPCAConfig:
             raise ValueError("track_window must be positive")
         if self.inner_loop_factor <= 0:
             raise ValueError("inner_loop_factor must be positive")
+        if self.hvp_mode not in {"auto", "autograd", "fd_grad"}:
+            raise ValueError("hvp_mode must be 'auto', 'autograd', or 'fd_grad'")
+        if self.fd_eps <= 0:
+            raise ValueError("fd_eps must be positive")
 
 
 @dataclass
